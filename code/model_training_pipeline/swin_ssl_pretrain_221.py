@@ -33,11 +33,28 @@ from transformers import Swinv2Model
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 BACKBONE_ID = "microsoft/swinv2-tiny-patch4-window8-256"
+DEFAULT_GDRIVE_ROOT = "/content/drive/My Drive/Petrographic images_ML work"
+DEFAULT_UNLABELED_SUBFOLDERS = (
+    "cretaceous thin sections",
+    "T/J photmicrographs",
+    "Permian-Triassic",
+)
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Masked SSL pretraining for SwinV2 on unlabeled petrography images.")
-    p.add_argument("--unlabeled_root", type=str, required=True, help="Folder containing img/ (or flat image folder).")
+    p.add_argument(
+        "--unlabeled_root",
+        type=str,
+        default=None,
+        help="Optional folder containing unlabeled images. If omitted, use Google Drive root + canonical subfolders.",
+    )
+    p.add_argument(
+        "--gdrive_root",
+        type=str,
+        default=DEFAULT_GDRIVE_ROOT,
+        help="Google Drive root containing the three unlabeled subfolders.",
+    )
     p.add_argument("--output_dir", type=str, default=".", help="Directory for SSL checkpoints.")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=8)
@@ -68,13 +85,8 @@ def set_seed(seed: int) -> None:
 class UnlabeledImageDataset(Dataset):
     EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
-    def __init__(self, root: str | Path, crop: int):
-        root = Path(root)
-        img_dir = root / "img"
-        search_dir = img_dir if img_dir.is_dir() else root
-        self.paths = sorted(
-            p for p in search_dir.iterdir() if p.is_file() and p.suffix.lower() in self.EXTS and not p.name.startswith(".")
-        )
+    def __init__(self, paths: list[Path], crop: int):
+        self.paths = sorted(paths)
         self.transforms = Compose(
             [
                 RandomResizedCrop((crop, crop), scale=(0.7, 1.0), antialias=True),
@@ -168,6 +180,31 @@ def strip_backbone_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torc
     return cleaned
 
 
+def collect_images_recursive(root: Path) -> list[Path]:
+    return sorted(
+        p
+        for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in UnlabeledImageDataset.EXTS and not p.name.startswith(".")
+    )
+
+
+def resolve_unlabeled_paths(args: argparse.Namespace) -> list[Path]:
+    if args.unlabeled_root:
+        root = Path(args.unlabeled_root)
+        return collect_images_recursive(root)
+
+    base = Path(args.gdrive_root)
+    all_paths: list[Path] = []
+    for sub in DEFAULT_UNLABELED_SUBFOLDERS:
+        subdir = base / sub
+        if subdir.is_dir():
+            all_paths.extend(collect_images_recursive(subdir))
+        else:
+            print(f"[ssl] Warning: unlabeled folder not found: {subdir}")
+    # Deduplicate while preserving path objects.
+    return sorted(set(all_paths))
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -175,9 +212,15 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    ds = UnlabeledImageDataset(args.unlabeled_root, crop=args.crop)
+    paths = resolve_unlabeled_paths(args)
+    ds = UnlabeledImageDataset(paths, crop=args.crop)
     if len(ds) == 0 and not args.no_strict_file_check:
-        raise RuntimeError(f"No images found under {args.unlabeled_root} (or its img/ subfolder).")
+        if args.unlabeled_root:
+            raise RuntimeError(f"No images found under {args.unlabeled_root}.")
+        raise RuntimeError(
+            "No images found under Google Drive unlabeled subfolders: "
+            + ", ".join(str(Path(args.gdrive_root) / s) for s in DEFAULT_UNLABELED_SUBFOLDERS)
+        )
     print(f"[ssl] Found {len(ds)} unlabeled images")
 
     on_gpu = torch.cuda.is_available()
