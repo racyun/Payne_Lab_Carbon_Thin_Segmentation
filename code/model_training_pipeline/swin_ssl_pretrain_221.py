@@ -40,8 +40,9 @@ DEFAULT_UNLABELED_SUBFOLDERS = (
     "cretaceous thin sections",
     "Permian-Triassic",
 )
-# Drive copies sometimes use "photmicrographs" (one 'o') vs "photomicrographs" — try both.
+# Drive copies may vary in slash/spelling; try all common aliases.
 T_J_UNLABELED_ALIASES = (
+    "TJ photomicrographs",
     "T/J photomicrographs",
     "T/J photmicrographs",
 )
