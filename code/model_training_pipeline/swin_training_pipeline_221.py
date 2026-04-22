@@ -91,6 +91,20 @@ def parse_args() -> argparse.Namespace:
         help="Optional path to a .npy vector of shape (num_classes,) for weighted cross-entropy "
         "(training uses manual loss when set).",
     )
+    p.add_argument(
+        "--auto_class_weights",
+        action="store_true",
+        help="Estimate inverse-frequency class weights from training masks.",
+    )
+    p.add_argument(
+        "--scheduler",
+        type=str,
+        default="none",
+        choices=["none", "cosine", "step"],
+        help="Learning-rate scheduler for finetuning.",
+    )
+    p.add_argument("--step_size", type=int, default=10, help="StepLR step size when scheduler=step.")
+    p.add_argument("--gamma", type=float, default=0.5, help="StepLR gamma when scheduler=step.")
     p.add_argument("--tile_size", type=int, default=512, help="Tile edge length for ``predict_image_tiled``.")
     p.add_argument("--tile_stride", type=int, default=None, help="Stride for tiling; default = tile_size // 2.")
     p.add_argument(
@@ -159,6 +173,26 @@ def load_ssl_backbone_checkpoint(model: UperNetForSemanticSegmentation, checkpoi
         ckpt_path,
         f"\n  missing={len(missing)} keys, unexpected={len(unexpected)} keys",
     )
+
+
+def estimate_class_weights_from_dataset(
+    dataset, num_classes: int, ignore_index: int, device: torch.device
+) -> torch.Tensor:
+    counts = torch.zeros(num_classes, dtype=torch.float64)
+    for _, labels in dataset:
+        flat = labels.view(-1)
+        valid = (flat != ignore_index) & (flat >= 0) & (flat < num_classes)
+        if valid.any():
+            binc = torch.bincount(flat[valid], minlength=num_classes).to(torch.float64)
+            counts += binc
+
+    if counts.sum() == 0:
+        return torch.ones(num_classes, dtype=torch.float32, device=device)
+
+    counts = torch.clamp(counts, min=1.0)
+    inv = 1.0 / counts
+    weights = inv / inv.mean()
+    return weights.to(dtype=torch.float32, device=device)
 
 
 class CarbonateSegmentationDataset(torch.utils.data.Dataset):
@@ -287,6 +321,7 @@ def train_one_epoch(
     num_classes: int,
     ignore_index: int,
     class_weights: torch.Tensor | None,
+    scheduler=None,
 ) -> float:
     model.train()
     total, n = 0.0, 0
@@ -312,6 +347,9 @@ def train_one_epoch(
         total += float(loss.item()) * bs
         n += bs
         pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{total/max(1,n):.4f}")
+
+    if scheduler is not None:
+        scheduler.step()
 
     print(f"epoch {epoch:02d} | train_avg_loss {total/max(1,n):.4f}")
     return total / max(1, n)
@@ -548,15 +586,26 @@ def main() -> None:
         if w.shape != (NUM_CLASSES,):
             raise ValueError(f"class_weights .npy must have shape ({NUM_CLASSES},), got {w.shape}")
         class_weights = torch.tensor(w, device=device)
+    elif args.auto_class_weights:
+        class_weights = estimate_class_weights_from_dataset(train_ds, NUM_CLASSES, IGNORE_INDEX, device)
+        print("[train] Using auto-estimated class weights:", class_weights.detach().cpu().numpy().round(3).tolist())
 
     model = get_model_semantic_segmentation(NUM_CLASSES, IGNORE_INDEX, BACKBONE_ID)
     if args.backbone_checkpoint:
         load_ssl_backbone_checkpoint(model, args.backbone_checkpoint)
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = None
+    if args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+    elif args.scheduler == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(1, args.step_size), gamma=args.gamma)
 
     best_miou = -1.0
     ckpt_path = out_dir / "best_upernet_swinv2.pth"
+    per_class_log_path = out_dir / "val_per_class_iou.csv"
+    with per_class_log_path.open("w", encoding="utf-8") as f:
+        f.write("epoch," + ",".join(f"class_{i}" for i in range(NUM_CLASSES)) + "\n")
 
     for epoch in range(1, args.epochs + 1):
         tr = train_one_epoch(
@@ -568,6 +617,7 @@ def main() -> None:
             NUM_CLASSES,
             IGNORE_INDEX,
             class_weights,
+            scheduler,
         )
         va_loss, va_acc, va_miou, per_iou = evaluate(
             model, val_loader, device, NUM_CLASSES, IGNORE_INDEX, class_weights
@@ -575,6 +625,9 @@ def main() -> None:
         print(
             f"Epoch {epoch:02d} | train {tr:.4f} | val {va_loss:.4f} | acc {va_acc:.3f} | mIoU {va_miou:.3f}"
         )
+        with per_class_log_path.open("a", encoding="utf-8") as f:
+            vals = ",".join(f"{float(v):.6f}" if torch.isfinite(v) else "nan" for v in per_iou.detach().cpu())
+            f.write(f"{epoch},{vals}\n")
         if va_miou > best_miou:
             best_miou = va_miou
             torch.save(
