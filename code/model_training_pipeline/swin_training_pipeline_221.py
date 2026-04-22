@@ -93,6 +93,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--tile_size", type=int, default=512, help="Tile edge length for ``predict_image_tiled``.")
     p.add_argument("--tile_stride", type=int, default=None, help="Stride for tiling; default = tile_size // 2.")
+    p.add_argument(
+        "--backbone_checkpoint",
+        type=str,
+        default=None,
+        help="Optional SSL checkpoint path; loads checkpoint['backbone_state'] into model.backbone.",
+    )
     p.add_argument("--no_viz", action="store_true", help="Skip matplotlib overlay at end of training.")
     return p.parse_args()
 
@@ -124,6 +130,35 @@ def get_model_semantic_segmentation(
         use_auxiliary_head=False,
     )
     return UperNetForSemanticSegmentation(cfg)
+
+
+def load_ssl_backbone_checkpoint(model: UperNetForSemanticSegmentation, checkpoint_path: str | Path) -> None:
+    ckpt_path = Path(checkpoint_path)
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(f"backbone checkpoint not found: {ckpt_path}")
+
+    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+    if "backbone_state" in ckpt and isinstance(ckpt["backbone_state"], dict):
+        ssl_sd = ckpt["backbone_state"]
+    elif "model_state" in ckpt and isinstance(ckpt["model_state"], dict):
+        # Fallback if checkpoint was saved without a dedicated backbone_state.
+        ssl_sd = {
+            k.replace("backbone.", "", 1): v
+            for k, v in ckpt["model_state"].items()
+            if k.startswith("backbone.")
+        }
+    else:
+        raise KeyError(
+            "Checkpoint missing 'backbone_state' and compatible 'model_state'. "
+            "Expected an SSL checkpoint from swin_ssl_pretrain_221.py."
+        )
+
+    missing, unexpected = model.backbone.load_state_dict(ssl_sd, strict=False)
+    print(
+        "[ssl->finetune] loaded backbone checkpoint:",
+        ckpt_path,
+        f"\n  missing={len(missing)} keys, unexpected={len(unexpected)} keys",
+    )
 
 
 class CarbonateSegmentationDataset(torch.utils.data.Dataset):
@@ -515,6 +550,8 @@ def main() -> None:
         class_weights = torch.tensor(w, device=device)
 
     model = get_model_semantic_segmentation(NUM_CLASSES, IGNORE_INDEX, BACKBONE_ID)
+    if args.backbone_checkpoint:
+        load_ssl_backbone_checkpoint(model, args.backbone_checkpoint)
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
