@@ -180,7 +180,7 @@ def estimate_class_weights_from_dataset(
 ) -> torch.Tensor:
     counts = torch.zeros(num_classes, dtype=torch.float64)
     for _, labels in dataset:
-        flat = labels.view(-1)
+        flat = labels.reshape(-1)
         valid = (flat != ignore_index) & (flat >= 0) & (flat < num_classes)
         if valid.any():
             binc = torch.bincount(flat[valid], minlength=num_classes).to(torch.float64)
