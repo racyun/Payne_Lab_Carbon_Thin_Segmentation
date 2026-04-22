@@ -35,10 +35,15 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 BACKBONE_ID = "microsoft/swinv2-tiny-patch4-window8-256"
 DEFAULT_GDRIVE_ROOT = "/content/drive/My Drive/Petrographic images_ML work"
+# Top-level unlabeled regions under GDRIVE_ROOT (each scanned recursively).
 DEFAULT_UNLABELED_SUBFOLDERS = (
     "cretaceous thin sections",
-    "T/J photomicrographs",
     "Permian-Triassic",
+)
+# Drive copies sometimes use "photmicrographs" (one 'o') vs "photomicrographs" — try both.
+T_J_UNLABELED_ALIASES = (
+    "T/J photomicrographs",
+    "T/J photmicrographs",
 )
 
 
@@ -214,6 +219,21 @@ def resolve_unlabeled_paths(args: argparse.Namespace) -> list[Path]:
             all_paths.extend(collect_images_recursive(subdir))
         else:
             print(f"[ssl] Warning: unlabeled folder not found: {subdir}")
+
+    tj_found: list[Path] = []
+    for sub in T_J_UNLABELED_ALIASES:
+        subdir = base / sub
+        if subdir.is_dir():
+            tj_found.append(subdir)
+            all_paths.extend(collect_images_recursive(subdir))
+    if tj_found:
+        print("[ssl] T/J unlabeled folder(s) used:", ", ".join(str(p) for p in tj_found))
+    else:
+        print(
+            "[ssl] Warning: T/J folder not found. Tried:\n  "
+            + "\n  ".join(str(base / s) for s in T_J_UNLABELED_ALIASES)
+        )
+
     # Deduplicate while preserving path objects.
     return sorted(set(all_paths))
 
@@ -282,9 +302,10 @@ def main() -> None:
     if len(ds) == 0 and not args.no_strict_file_check:
         if args.unlabeled_root:
             raise RuntimeError(f"No images found under {args.unlabeled_root}.")
+        _subs = list(DEFAULT_UNLABELED_SUBFOLDERS) + list(T_J_UNLABELED_ALIASES)
         raise RuntimeError(
             "No images found under Google Drive unlabeled subfolders: "
-            + ", ".join(str(Path(args.gdrive_root) / s) for s in DEFAULT_UNLABELED_SUBFOLDERS)
+            + ", ".join(str(Path(args.gdrive_root) / s) for s in _subs)
         )
     print(f"[ssl] Found {len(ds)} unlabeled images")
 
