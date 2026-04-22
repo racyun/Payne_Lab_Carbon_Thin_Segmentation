@@ -37,7 +37,7 @@ BACKBONE_ID = "microsoft/swinv2-tiny-patch4-window8-256"
 DEFAULT_GDRIVE_ROOT = "/content/drive/My Drive/Petrographic images_ML work"
 DEFAULT_UNLABELED_SUBFOLDERS = (
     "cretaceous thin sections",
-    "T/J photmicrographs",
+    "T/J photomicrographs",
     "Permian-Triassic",
 )
 
