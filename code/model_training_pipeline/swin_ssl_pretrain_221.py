@@ -29,6 +29,7 @@ from torchvision.transforms.v2 import Compose, RandomHorizontalFlip, RandomResiz
 from torchvision.transforms.v2 import functional as V2F
 from tqdm.auto import tqdm
 from transformers import Swinv2Model
+import matplotlib.pyplot as plt
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -71,6 +72,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--amp", action="store_true", help="Enable AMP mixed precision.")
     p.add_argument("--max_steps_per_epoch", type=int, default=0, help="0 means full epoch.")
     p.add_argument("--no_strict_file_check", action="store_true", help="Skip empty dataset hard-fail.")
+    p.add_argument(
+        "--save_recon_every",
+        type=int,
+        default=1,
+        help="Save reconstruction preview every N epochs (0 disables).",
+    )
+    p.add_argument(
+        "--num_recon_samples",
+        type=int,
+        default=2,
+        help="Number of batch items shown in each reconstruction preview.",
+    )
     return p.parse_args()
 
 
@@ -205,6 +218,58 @@ def resolve_unlabeled_paths(args: argparse.Namespace) -> list[Path]:
     return sorted(set(all_paths))
 
 
+def denorm_to_uint8(img_3chw: torch.Tensor) -> np.ndarray:
+    mean = torch.tensor(IMAGENET_MEAN, device=img_3chw.device).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=img_3chw.device).view(3, 1, 1)
+    x = img_3chw * std + mean
+    x = x.clamp(0, 1).detach().cpu().numpy()
+    return (np.transpose(x, (1, 2, 0)) * 255.0).astype(np.uint8)
+
+
+def save_reconstruction_preview(
+    epoch: int,
+    output_dir: Path,
+    imgs: torch.Tensor,
+    masked_imgs: torch.Tensor,
+    pred: torch.Tensor,
+    mask: torch.Tensor,
+    max_samples: int,
+) -> None:
+    preview_dir = output_dir / "recon_previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    n = min(max_samples, imgs.shape[0])
+    fig, axes = plt.subplots(nrows=n, ncols=4, figsize=(14, 3 * n))
+    if n == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    for i in range(n):
+        orig_np = denorm_to_uint8(imgs[i])
+        masked_np = denorm_to_uint8(masked_imgs[i])
+        recon_np = denorm_to_uint8(pred[i].clamp(-5, 5))
+
+        m = mask[i, 0].detach().cpu().numpy()
+        recon_mix = orig_np.copy()
+        recon_mix[m > 0.5] = recon_np[m > 0.5]
+
+        axes[i, 0].imshow(orig_np)
+        axes[i, 0].set_title("Original")
+        axes[i, 1].imshow(masked_np)
+        axes[i, 1].set_title("Masked Input")
+        axes[i, 2].imshow(recon_np)
+        axes[i, 2].set_title("Reconstruction")
+        axes[i, 3].imshow(recon_mix)
+        axes[i, 3].set_title("Masked Region Replaced")
+        for j in range(4):
+            axes[i, j].axis("off")
+
+    plt.tight_layout()
+    out_file = preview_dir / f"epoch_{epoch + 1:03d}.png"
+    plt.savefig(out_file, dpi=150)
+    plt.close(fig)
+    print(f"[ssl] saved reconstruction preview: {out_file}")
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -258,6 +323,7 @@ def main() -> None:
         model.train()
         running = 0.0
         steps = 0
+        preview_cache = None
         pbar = tqdm(loader, desc=f"ssl epoch {epoch + 1:03d}", leave=False)
         for imgs in pbar:
             imgs = imgs.to(device, non_blocking=True)
@@ -284,12 +350,31 @@ def main() -> None:
             running += float(loss.item())
             steps += 1
             pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{running / max(1, steps):.4f}", lr=f"{lr:.2e}")
+            if preview_cache is None:
+                preview_cache = (
+                    imgs.detach().cpu(),
+                    masked_imgs.detach().cpu(),
+                    pred.detach().cpu(),
+                    mask.detach().cpu(),
+                )
 
             if args.max_steps_per_epoch > 0 and steps >= args.max_steps_per_epoch:
                 break
 
         epoch_loss = running / max(1, steps)
         print(f"[ssl] epoch {epoch + 1:03d} | loss {epoch_loss:.5f} | lr {lr:.2e}")
+
+        if args.save_recon_every > 0 and ((epoch + 1) % args.save_recon_every == 0) and preview_cache is not None:
+            p_imgs, p_masked, p_pred, p_mask = preview_cache
+            save_reconstruction_preview(
+                epoch=epoch,
+                output_dir=out_dir,
+                imgs=p_imgs,
+                masked_imgs=p_masked,
+                pred=p_pred,
+                mask=p_mask,
+                max_samples=max(1, args.num_recon_samples),
+            )
 
         ckpt = {
             "epoch": epoch,
