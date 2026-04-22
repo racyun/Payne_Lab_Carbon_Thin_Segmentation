@@ -41,6 +41,12 @@ NUM_CLASSES = 16
 IGNORE_INDEX = 255
 SCALE_BAR_CLASS_ID = 11
 BACKBONE_ID = "microsoft/swinv2-tiny-patch4-window8-256"
+DEFAULT_GDRIVE_LABELED_IMG_DIR = (
+    "/content/drive/My Drive/Petrographic images_ML work/labelled images_PS/labelled images_PS/my_dataset/img"
+)
+DEFAULT_GDRIVE_LABELED_MASK_DIR = (
+    "/content/drive/My Drive/Petrographic images_ML work/labelled images_PS/labelled images_PS/my_dataset/masks_machine"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,6 +56,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Root folder containing ``img/`` and ``masks/``. Default: repo data path when unset.",
+    )
+    p.add_argument(
+        "--img_dir",
+        type=str,
+        default=DEFAULT_GDRIVE_LABELED_IMG_DIR,
+        help="Explicit labeled image directory. Overrides data_root/img when set.",
+    )
+    p.add_argument(
+        "--mask_dir",
+        type=str,
+        default=DEFAULT_GDRIVE_LABELED_MASK_DIR,
+        help="Explicit labeled mask directory. Overrides data_root/masks when set.",
     )
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=2)
@@ -117,6 +135,8 @@ class CarbonateSegmentationDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         root: str | Path,
+        img_dir: str | Path | None = None,
+        mask_dir: str | Path | None = None,
         transforms=None,
         normalize: bool = True,
         strict: bool = True,
@@ -131,8 +151,8 @@ class CarbonateSegmentationDataset(torch.utils.data.Dataset):
         self.ignore_index = ignore_index
         self._print_pair_count = print_pair_count
 
-        img_dir = self.root / "img"
-        mask_dir = self.root / "masks"
+        img_dir = Path(img_dir) if img_dir is not None else self.root / "img"
+        mask_dir = Path(mask_dir) if mask_dir is not None else self.root / "masks"
 
         imgs = {
             p.stem: p
@@ -379,7 +399,26 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
-    if args.data_root is None:
+    candidate_img_dir = Path(args.img_dir) if args.img_dir else None
+    candidate_mask_dir = Path(args.mask_dir) if args.mask_dir else None
+    use_explicit_dirs = bool(
+        candidate_img_dir
+        and candidate_mask_dir
+        and candidate_img_dir.is_dir()
+        and candidate_mask_dir.is_dir()
+    )
+    if use_explicit_dirs:
+        data_root = Path(args.data_root) if args.data_root else Path(".")
+        img_dir = candidate_img_dir
+        mask_dir = candidate_mask_dir
+        print(f"[config] Using explicit labeled dirs:\n  img={img_dir}\n  mask={mask_dir}")
+    elif args.data_root is None:
+        if candidate_img_dir or candidate_mask_dir:
+            print(
+                "[config] Explicit labeled dirs not found; falling back to --data_root/default layout.\n"
+                f"  checked img_dir={candidate_img_dir}\n"
+                f"  checked mask_dir={candidate_mask_dir}"
+            )
         data_root = default_data_root()
         if not (data_root / "img").is_dir():
             raise SystemExit(
@@ -404,6 +443,8 @@ def main() -> None:
 
     probe = CarbonateSegmentationDataset(
         data_root,
+        img_dir=img_dir if use_explicit_dirs else None,
+        mask_dir=mask_dir if use_explicit_dirs else None,
         transforms=None,
         normalize=True,
         strict=True,
@@ -419,6 +460,8 @@ def main() -> None:
 
     train_full = CarbonateSegmentationDataset(
         data_root,
+        img_dir=img_dir if use_explicit_dirs else None,
+        mask_dir=mask_dir if use_explicit_dirs else None,
         transforms=train_transforms,
         normalize=True,
         strict=False,
@@ -427,6 +470,8 @@ def main() -> None:
     )
     val_full = CarbonateSegmentationDataset(
         data_root,
+        img_dir=img_dir if use_explicit_dirs else None,
+        mask_dir=mask_dir if use_explicit_dirs else None,
         transforms=val_transforms,
         normalize=True,
         strict=False,
