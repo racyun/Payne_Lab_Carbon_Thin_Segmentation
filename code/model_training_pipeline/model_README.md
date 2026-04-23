@@ -19,7 +19,7 @@ Unlabeled carbonate thin sections (no masks needed)
        │
        ▼
  SwinV2-Tiny encoder learns to reconstruct
- hidden 16 px blocks (~55% of the image)
+ hidden 16 px blocks (~75% of the image)
        │
        ▼
  Encoder now "understands" carbonate textures,
@@ -50,7 +50,7 @@ Pretrained Swin backbone weights
 │                                                                                          │
 │   Unlabeled     ┌──────────────┐    ┌────────────────┐    ┌──────────────┐              │
 │   carbonate ──▶ │  Block mask  │──▶ │ SwinV2-Tiny    │──▶ │ ConvTranspose│──▶ recon     │
-│   crop          │  ~55% hidden │    │ encoder (4     │    │ decoder      │    512×512   │
+│   crop          │  ~75% hidden │    │ encoder (4     │    │ decoder      │    512×512   │
 │   512×512       │  16 px blocks│    │ hierarchical   │    │ (discarded   │      │       │
 │                 └──────────────┘    │ stages)        │    │  after SSL)  │      │       │
 │                                     └────────────────┘    └──────────────┘      │       │
