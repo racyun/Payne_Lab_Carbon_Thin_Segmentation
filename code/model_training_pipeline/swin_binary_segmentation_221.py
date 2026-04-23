@@ -429,6 +429,7 @@ def run_single_fold(
 
 def main() -> None:
     args = parse_args()
+    print("[binary] args parsed; building data / model (first messages can take a minute)…", flush=True)
     set_seed(args.seed)
 
     data_root, img_dir, mask_dir = resolve_data_paths(args)
