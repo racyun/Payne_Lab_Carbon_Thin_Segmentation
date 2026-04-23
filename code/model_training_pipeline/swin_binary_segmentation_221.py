@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torchvision import tv_tensors
@@ -34,7 +35,7 @@ from tqdm.auto import tqdm
 
 from transformers import UperNetConfig, UperNetForSemanticSegmentation
 
-from swin_training_pipeline_221 import evaluate, set_seed, train_one_epoch
+from swin_training_pipeline_221 import confusion_matrix, miou_from_confusion, pixel_accuracy, set_seed, train_one_epoch
 
 NUM_BINARY_CLASSES = 2
 IGNORE_INDEX = 255
@@ -267,6 +268,59 @@ def print_binary_per_class_iou(per_iou: torch.Tensor, epoch: int) -> None:
             print(f"    {name} IoU: nan")
 
 
+@torch.no_grad()
+def evaluate_binary_with_splits(
+    model,
+    loader,
+    device: torch.device,
+    num_classes: int,
+    ignore_index: int,
+) -> tuple[float, float, float, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      val_loss, pixel_acc, mIoU, per_class_iou,
+      gt_pixel_frac_per_class, pred_pixel_frac_per_class
+    where the split vectors are normalized over valid (non-ignore) validation pixels.
+    """
+    model.eval()
+    total, n = 0.0, 0
+    acc_sum, m = 0.0, 0
+    cm_total = torch.zeros(num_classes, num_classes, device=device, dtype=torch.float32)
+
+    for imgs, labels in loader:
+        imgs = imgs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        out = model(pixel_values=imgs, labels=labels)
+        loss = out.loss
+        logits = F.interpolate(out.logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+        preds = logits.argmax(dim=1)
+
+        acc_sum += pixel_accuracy(preds, labels, ignore_index)
+        cm_total += confusion_matrix(preds, labels, num_classes, ignore_index)
+
+        bs = imgs.size(0)
+        total += float(loss.item()) * bs
+        n += bs
+        m += 1
+
+    miou, per_class = miou_from_confusion(cm_total)
+    gt_counts = cm_total.sum(1)
+    pred_counts = cm_total.sum(0)
+    gt_frac = gt_counts / torch.clamp(gt_counts.sum(), min=1.0)
+    pred_frac = pred_counts / torch.clamp(pred_counts.sum(), min=1.0)
+    return total / max(1, n), acc_sum / max(1, m), miou, per_class, gt_frac, pred_frac
+
+
+def print_binary_gt_pred_split(gt_frac: torch.Tensor, pred_frac: torch.Tensor, epoch: int) -> None:
+    """Print validation pixel split for ground truth vs prediction (background/grain)."""
+    gt = gt_frac.detach().cpu()
+    pr = pred_frac.detach().cpu()
+    print(f"  val pixel split (epoch {epoch:02d}):")
+    print(f"    ground truth -> background: {100.0 * float(gt[0]):.2f}% | grain: {100.0 * float(gt[1]):.2f}%")
+    print(f"    prediction   -> background: {100.0 * float(pr[0]):.2f}% | grain: {100.0 * float(pr[1]):.2f}%")
+
+
 def resolve_data_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     candidate_img_dir = Path(args.img_dir) if args.img_dir else None
     candidate_mask_dir = Path(args.mask_dir) if args.mask_dir else None
@@ -376,6 +430,12 @@ def run_single_fold(
     with metrics_csv.open("w", encoding="utf-8") as f:
         f.write("epoch,train_loss,val_loss,pixel_acc,miou,iou_bg,iou_grain\n")
 
+    print(
+        "[train] Tqdm will sit at 0% until the first batch completes (read masks + UPerNet forward). "
+        "If `img`/`mask` are on Google Drive, that often takes 1–4+ minutes; prefer --num_workers 0 in Colab.",
+        flush=True,
+    )
+
     for epoch in range(1, args.epochs + 1):
         effective_loader = (
             _CappedLoader(train_loader, args.max_steps_per_epoch)
@@ -394,8 +454,8 @@ def run_single_fold(
             None,
             scheduler=None,
         )
-        va_loss, va_acc, va_miou, per_iou = evaluate(
-            model, val_loader, device, NUM_BINARY_CLASSES, IGNORE_INDEX, None
+        va_loss, va_acc, va_miou, per_iou, gt_frac, pred_frac = evaluate_binary_with_splits(
+            model, val_loader, device, NUM_BINARY_CLASSES, IGNORE_INDEX
         )
         # Match multiclass script: 3 d.p. for acc and mIoU; fold index in the epoch line for CV
         print(
@@ -403,6 +463,7 @@ def run_single_fold(
             f"acc {va_acc:.3f} | mIoU {va_miou:.3f}"
         )
         print_binary_per_class_iou(per_iou, epoch)
+        print_binary_gt_pred_split(gt_frac, pred_frac, epoch)
 
         i0 = float(per_iou[0].item()) if torch.isfinite(per_iou[0]).item() else float("nan")
         i1 = float(per_iou[1].item()) if torch.isfinite(per_iou[1]).item() else float("nan")
