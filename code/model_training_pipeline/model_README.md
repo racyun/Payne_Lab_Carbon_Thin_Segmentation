@@ -18,28 +18,23 @@ Stage 1: Self-supervised Pretraining (Masked Image Modeling)
 Unlabeled carbonate thin sections (no masks needed)
        │
        ▼
- SwinV2-Tiny encoder learns to reconstruct
- hidden 16 px blocks (~75% of the image)
+ SwinV2-Tiny encoder learns to reconstruct hidden 16 px blocks (~75% of the image)
        │
        ▼
- Encoder now "understands" carbonate textures,
- grain morphology, and matrix/cement patterns
+ Encoder now "understands" carbonate textures, grain morphology, and matrix/cement patterns
 
 
 Stage 2: Supervised Finetuning (Swin + UPerNet)
 ───────────────────────────────────────────────
 
-Pretrained Swin backbone weights
+ Pretrained Swin backbone weights
        │
        ▼
- Fine-tune on labeled 16-class masks
- (cross-entropy, optional class weights)
+ Fine-tune on labeled 16-class masks (cross-entropy, optional class weights)
        │
        ▼
- Per-pixel predictions across 16 carbonate
- classes (background, bivalves, micrite, cement,
- echinoderms, forams, calc. algae, peloids,
- unid biota, ooids, gastropods, scale bar,
+ Per-pixel predictions across 16 carbonate classes (background, bivalves, micrite, cement,
+ echinoderms, forams, calc. algae, peloids, unid biota, ooids, gastropods, scale bar,
  mollusks, ostracods, aggregate grains, brachiopods)
 ```
 
