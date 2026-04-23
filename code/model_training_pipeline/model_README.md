@@ -15,7 +15,7 @@ The two stages are connected by a weight-transfer step: the backbone learned in 
 Stage 1: Self-supervised Pretraining (Masked Image Modeling)
 ───────────────────────────────────────────────────────────
 
-Unlabeled carbonate thin sections (no masks needed)
+ Unlabeled carbonate thin sections (no masks needed)
        │
        ▼
  SwinV2-Tiny encoder learns to reconstruct hidden 16 px blocks (~75% of the image)
