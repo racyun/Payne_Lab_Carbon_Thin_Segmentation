@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torchvision import tv_tensors
@@ -34,12 +35,13 @@ from tqdm.auto import tqdm
 
 from transformers import UperNetConfig, UperNetForSemanticSegmentation
 
-from swin_training_pipeline_221 import evaluate, set_seed, train_one_epoch
+from swin_training_pipeline_221 import confusion_matrix, miou_from_confusion, pixel_accuracy, set_seed, train_one_epoch
 
 NUM_BINARY_CLASSES = 2
 IGNORE_INDEX = 255
 BACKBONE_ID = "microsoft/swinv2-tiny-patch4-window8-256"
-BINARY_CLASS_NAMES = ("non_grain_background", "grain")
+# Log labels (match multiclass-style “background / class …” phrasing; task is binary: background vs grain)
+BINARY_CLASS_NAMES = ("background", "grain")
 
 
 def _json_sanitize(obj):
@@ -156,9 +158,9 @@ def load_ssl_backbone_checkpoint(model: UperNetForSemanticSegmentation, checkpoi
 
     missing, unexpected = model.backbone.load_state_dict(ssl_sd, strict=False)
     print(
-        "[ssl->binary] loaded backbone:",
+        "[ssl->finetune] loaded backbone checkpoint:",
         ckpt_path,
-        f"\n  missing={len(missing)} unexpected={len(unexpected)}",
+        f"\n  missing={len(missing)} keys, unexpected={len(unexpected)} keys",
     )
 
 
@@ -203,7 +205,10 @@ class BinaryCarbonateDataset(torch.utils.data.Dataset):
             if not self.pairs:
                 raise RuntimeError("Found no (image, mask) pairs.")
         if self._print_pair_count:
-            print(f"[binary dataset] {len(self.pairs)} paired samples (multiclass -> binary in __getitem__).")
+            print(
+                f"[dataset] Using {len(self.pairs)} paired samples. "
+                "(Masks: multiclass 0–15/255; training uses binary 0=background, 1=grain, 255=ignore.)"
+            )
 
     def __getitem__(self, idx: int):
         img_path, mask_path = self.pairs[idx]
@@ -263,6 +268,59 @@ def print_binary_per_class_iou(per_iou: torch.Tensor, epoch: int) -> None:
             print(f"    {name} IoU: nan")
 
 
+@torch.no_grad()
+def evaluate_binary_with_splits(
+    model,
+    loader,
+    device: torch.device,
+    num_classes: int,
+    ignore_index: int,
+) -> tuple[float, float, float, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      val_loss, pixel_acc, mIoU, per_class_iou,
+      gt_pixel_frac_per_class, pred_pixel_frac_per_class
+    where the split vectors are normalized over valid (non-ignore) validation pixels.
+    """
+    model.eval()
+    total, n = 0.0, 0
+    acc_sum, m = 0.0, 0
+    cm_total = torch.zeros(num_classes, num_classes, device=device, dtype=torch.float32)
+
+    for imgs, labels in loader:
+        imgs = imgs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        out = model(pixel_values=imgs, labels=labels)
+        loss = out.loss
+        logits = F.interpolate(out.logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+        preds = logits.argmax(dim=1)
+
+        acc_sum += pixel_accuracy(preds, labels, ignore_index)
+        cm_total += confusion_matrix(preds, labels, num_classes, ignore_index)
+
+        bs = imgs.size(0)
+        total += float(loss.item()) * bs
+        n += bs
+        m += 1
+
+    miou, per_class = miou_from_confusion(cm_total)
+    gt_counts = cm_total.sum(1)
+    pred_counts = cm_total.sum(0)
+    gt_frac = gt_counts / torch.clamp(gt_counts.sum(), min=1.0)
+    pred_frac = pred_counts / torch.clamp(pred_counts.sum(), min=1.0)
+    return total / max(1, n), acc_sum / max(1, m), miou, per_class, gt_frac, pred_frac
+
+
+def print_binary_gt_pred_split(gt_frac: torch.Tensor, pred_frac: torch.Tensor, epoch: int) -> None:
+    """Print validation pixel split for ground truth vs prediction (background/grain)."""
+    gt = gt_frac.detach().cpu()
+    pr = pred_frac.detach().cpu()
+    print(f"  val pixel split (epoch {epoch:02d}):")
+    print(f"    ground truth -> background: {100.0 * float(gt[0]):.2f}% | grain: {100.0 * float(gt[1]):.2f}%")
+    print(f"    prediction   -> background: {100.0 * float(pr[0]):.2f}% | grain: {100.0 * float(pr[1]):.2f}%")
+
+
 def resolve_data_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     candidate_img_dir = Path(args.img_dir) if args.img_dir else None
     candidate_mask_dir = Path(args.mask_dir) if args.mask_dir else None
@@ -274,6 +332,9 @@ def resolve_data_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     )
     if use_explicit:
         data_root = Path(args.data_root) if args.data_root else Path(".")
+        print(
+            f"[config] Using explicit labeled dirs:\n  img={candidate_img_dir}\n  mask={candidate_mask_dir}"
+        )
         return data_root, candidate_img_dir, candidate_mask_dir
     if args.data_root is None:
         data_root = default_data_root()
@@ -287,6 +348,7 @@ def resolve_data_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
 
 def run_single_fold(
     fold: int,
+    n_folds: int,
     train_idx: list[int],
     val_idx: list[int],
     data_root: Path,
@@ -347,7 +409,9 @@ def run_single_fold(
     fold_dir = Path(args.output_dir) / f"fold_{fold}"
     fold_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n=== Fold {fold} | train {len(train_ds)} | val {len(val_ds)} ===")
+    print(
+        f"\n[binary] Fold {fold + 1}/{n_folds} | Train samples: {len(train_ds)} | Val samples: {len(val_ds)}"
+    )
 
     if args.no_train:
         return {"fold": fold, "status": "no_train"}
@@ -365,6 +429,12 @@ def run_single_fold(
 
     with metrics_csv.open("w", encoding="utf-8") as f:
         f.write("epoch,train_loss,val_loss,pixel_acc,miou,iou_bg,iou_grain\n")
+
+    print(
+        "[train] Tqdm will sit at 0% until the first batch completes (read masks + UPerNet forward). "
+        "If `img`/`mask` are on Google Drive, that often takes 1–4+ minutes; prefer --num_workers 0 in Colab.",
+        flush=True,
+    )
 
     for epoch in range(1, args.epochs + 1):
         effective_loader = (
@@ -384,14 +454,16 @@ def run_single_fold(
             None,
             scheduler=None,
         )
-        va_loss, va_acc, va_miou, per_iou = evaluate(
-            model, val_loader, device, NUM_BINARY_CLASSES, IGNORE_INDEX, None
+        va_loss, va_acc, va_miou, per_iou, gt_frac, pred_frac = evaluate_binary_with_splits(
+            model, val_loader, device, NUM_BINARY_CLASSES, IGNORE_INDEX
         )
+        # Match multiclass script: 3 d.p. for acc and mIoU; fold index in the epoch line for CV
         print(
             f"Fold {fold} | Epoch {epoch:02d} | train {tr:.4f} | val {va_loss:.4f} | "
-            f"acc {va_acc:.4f} | mIoU {va_miou:.4f}"
+            f"acc {va_acc:.3f} | mIoU {va_miou:.3f}"
         )
         print_binary_per_class_iou(per_iou, epoch)
+        print_binary_gt_pred_split(gt_frac, pred_frac, epoch)
 
         i0 = float(per_iou[0].item()) if torch.isfinite(per_iou[0]).item() else float("nan")
         i1 = float(per_iou[1].item()) if torch.isfinite(per_iou[1]).item() else float("nan")
@@ -419,7 +491,11 @@ def run_single_fold(
                 },
                 ckpt_path,
             )
-            print(f"  saved {ckpt_path}")
+            try:
+                saved_p = str(ckpt_path.resolve())
+            except OSError:
+                saved_p = str(ckpt_path)
+            print(f"  saved {saved_p}")
 
     assert best_row is not None
     best_row["fold"] = fold
@@ -433,8 +509,6 @@ def main() -> None:
 
     data_root, img_dir, mask_dir = resolve_data_paths(args)
     use_explicit = img_dir is not None and mask_dir is not None
-    if use_explicit:
-        print(f"[config] img={img_dir}\n  mask={mask_dir}")
 
     probe = BinaryCarbonateDataset(
         data_root,
@@ -447,6 +521,11 @@ def main() -> None:
     n = len(probe)
     if n < args.n_folds:
         raise SystemExit(f"Need at least {args.n_folds} samples for {args.n_folds}-fold CV; found {n}.")
+
+    print(
+        f"[config] Binary UPerNet+SwinV2 | {args.n_folds}-fold cross-validation | seed={args.seed} | "
+        f"drop_last_train=True (use batch_size>=2 as in multiclass recipe)"
+    )
 
     split_folds = kfold_train_val_indices(n, args.n_folds, args.seed)
 
@@ -469,6 +548,7 @@ def main() -> None:
         train_idx, val_idx = tr.tolist(), va.tolist()
         result = run_single_fold(
             fold,
+            args.n_folds,
             train_idx,
             val_idx,
             data_root,
