@@ -41,6 +41,26 @@ NUM_CLASSES = 16
 IGNORE_INDEX = 255
 SCALE_BAR_CLASS_ID = 11
 BACKBONE_ID = "microsoft/swinv2-tiny-patch4-window8-256"
+
+# Label ids 0–15 (must align with NUM_CLASSES).
+CLASS_NAMES = (
+    "background",
+    "bivalves",
+    "micrite",
+    "cement",
+    "echinoderms",
+    "foraminifera",
+    "calcareous algae",
+    "peloid",
+    "unid biota",
+    "ooid",
+    "gastropods",
+    "scale bar",
+    "mollusk",
+    "ostracod",
+    "aggregate grain",
+    "brachiopod",
+)
 DEFAULT_GDRIVE_LABELED_IMG_DIR = (
     "/content/drive/My Drive/Petrographic images_ML work/labelled images_PS/labelled images_PS/my_dataset/img"
 )
@@ -305,6 +325,18 @@ def confusion_matrix(pred: torch.Tensor, target: torch.Tensor, num_classes: int,
         return torch.zeros(num_classes, num_classes, device=pred.device, dtype=torch.float32)
     k = (target * num_classes + pred).to(torch.int64)
     return torch.bincount(k, minlength=num_classes * num_classes).reshape(num_classes, num_classes).float()
+
+
+def print_per_class_iou(per_iou: torch.Tensor, epoch: int) -> None:
+    """Pretty-print per-class validation IoU (one line per class)."""
+    print(f"  per-class val IoU (epoch {epoch:02d}):")
+    vec = per_iou.detach().cpu()
+    for i, name in enumerate(CLASS_NAMES[: len(vec)]):
+        v = vec[i]
+        if torch.isfinite(v).item():
+            print(f"    {name} IoU: {float(v):.4f}")
+        else:
+            print(f"    {name} IoU: nan")
 
 
 def miou_from_confusion(cm: torch.Tensor) -> tuple[float, torch.Tensor]:
@@ -631,6 +663,7 @@ def main() -> None:
         print(
             f"Epoch {epoch:02d} | train {tr:.4f} | val {va_loss:.4f} | acc {va_acc:.3f} | mIoU {va_miou:.3f}"
         )
+        print_per_class_iou(per_iou, epoch)
         with per_class_log_path.open("a", encoding="utf-8") as f:
             vals = ",".join(f"{float(v):.6f}" if torch.isfinite(v) else "nan" for v in per_iou.detach().cpu())
             f.write(f"{epoch},{vals}\n")
