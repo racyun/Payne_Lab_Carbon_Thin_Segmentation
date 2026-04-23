@@ -23,11 +23,6 @@ import math
 from pathlib import Path
 
 import numpy as np
-
-# Progress: heavy imports can take 1–4+ minutes on a cold Colab (Drive + first HF cache).
-# Print only when this file is the entry point so `import swin_binary_segmentation_221` stays quiet.
-if __name__ == "__main__":
-    print("[binary] loading PyTorch + CUDA stack (wait…)", flush=True)
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
@@ -37,21 +32,15 @@ from torchvision.transforms.v2 import CenterCrop, Compose, RandomCrop, RandomHor
 from torchvision.transforms.v2 import functional as V2F
 from tqdm.auto import tqdm
 
-if __name__ == "__main__":
-    print(f"[binary] torch {torch.__version__}; loading HuggingFace UPerNet…", flush=True)
 from transformers import UperNetConfig, UperNetForSemanticSegmentation
 
-if __name__ == "__main__":
-    print("[binary] loading swin_training_pipeline_221 helpers (second big import)…", flush=True)
 from swin_training_pipeline_221 import evaluate, set_seed, train_one_epoch
-
-if __name__ == "__main__":
-    print("[binary] imports finished; setting up data and model.", flush=True)
 
 NUM_BINARY_CLASSES = 2
 IGNORE_INDEX = 255
 BACKBONE_ID = "microsoft/swinv2-tiny-patch4-window8-256"
-BINARY_CLASS_NAMES = ("non_grain_background", "grain")
+# Log labels (match multiclass-style “background / class …” phrasing; task is binary: background vs grain)
+BINARY_CLASS_NAMES = ("background", "grain")
 
 
 def _json_sanitize(obj):
@@ -168,9 +157,9 @@ def load_ssl_backbone_checkpoint(model: UperNetForSemanticSegmentation, checkpoi
 
     missing, unexpected = model.backbone.load_state_dict(ssl_sd, strict=False)
     print(
-        "[ssl->binary] loaded backbone:",
+        "[ssl->finetune] loaded backbone checkpoint:",
         ckpt_path,
-        f"\n  missing={len(missing)} unexpected={len(unexpected)}",
+        f"\n  missing={len(missing)} keys, unexpected={len(unexpected)} keys",
     )
 
 
@@ -215,7 +204,10 @@ class BinaryCarbonateDataset(torch.utils.data.Dataset):
             if not self.pairs:
                 raise RuntimeError("Found no (image, mask) pairs.")
         if self._print_pair_count:
-            print(f"[binary dataset] {len(self.pairs)} paired samples (multiclass -> binary in __getitem__).")
+            print(
+                f"[dataset] Using {len(self.pairs)} paired samples. "
+                "(Masks: multiclass 0–15/255; training uses binary 0=background, 1=grain, 255=ignore.)"
+            )
 
     def __getitem__(self, idx: int):
         img_path, mask_path = self.pairs[idx]
@@ -286,6 +278,9 @@ def resolve_data_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     )
     if use_explicit:
         data_root = Path(args.data_root) if args.data_root else Path(".")
+        print(
+            f"[config] Using explicit labeled dirs:\n  img={candidate_img_dir}\n  mask={candidate_mask_dir}"
+        )
         return data_root, candidate_img_dir, candidate_mask_dir
     if args.data_root is None:
         data_root = default_data_root()
@@ -299,6 +294,7 @@ def resolve_data_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
 
 def run_single_fold(
     fold: int,
+    n_folds: int,
     train_idx: list[int],
     val_idx: list[int],
     data_root: Path,
@@ -359,7 +355,9 @@ def run_single_fold(
     fold_dir = Path(args.output_dir) / f"fold_{fold}"
     fold_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n=== Fold {fold} | train {len(train_ds)} | val {len(val_ds)} ===")
+    print(
+        f"\n[binary] Fold {fold + 1}/{n_folds} | Train samples: {len(train_ds)} | Val samples: {len(val_ds)}"
+    )
 
     if args.no_train:
         return {"fold": fold, "status": "no_train"}
@@ -399,9 +397,10 @@ def run_single_fold(
         va_loss, va_acc, va_miou, per_iou = evaluate(
             model, val_loader, device, NUM_BINARY_CLASSES, IGNORE_INDEX, None
         )
+        # Match multiclass script: 3 d.p. for acc and mIoU; fold index in the epoch line for CV
         print(
             f"Fold {fold} | Epoch {epoch:02d} | train {tr:.4f} | val {va_loss:.4f} | "
-            f"acc {va_acc:.4f} | mIoU {va_miou:.4f}"
+            f"acc {va_acc:.3f} | mIoU {va_miou:.3f}"
         )
         print_binary_per_class_iou(per_iou, epoch)
 
@@ -431,7 +430,11 @@ def run_single_fold(
                 },
                 ckpt_path,
             )
-            print(f"  saved {ckpt_path}")
+            try:
+                saved_p = str(ckpt_path.resolve())
+            except OSError:
+                saved_p = str(ckpt_path)
+            print(f"  saved {saved_p}")
 
     assert best_row is not None
     best_row["fold"] = fold
@@ -441,13 +444,10 @@ def run_single_fold(
 
 def main() -> None:
     args = parse_args()
-    print("[binary] args parsed; building data / model (first messages can take a minute)…", flush=True)
     set_seed(args.seed)
 
     data_root, img_dir, mask_dir = resolve_data_paths(args)
     use_explicit = img_dir is not None and mask_dir is not None
-    if use_explicit:
-        print(f"[config] img={img_dir}\n  mask={mask_dir}")
 
     probe = BinaryCarbonateDataset(
         data_root,
@@ -460,6 +460,11 @@ def main() -> None:
     n = len(probe)
     if n < args.n_folds:
         raise SystemExit(f"Need at least {args.n_folds} samples for {args.n_folds}-fold CV; found {n}.")
+
+    print(
+        f"[config] Binary UPerNet+SwinV2 | {args.n_folds}-fold cross-validation | seed={args.seed} | "
+        f"drop_last_train=True (use batch_size>=2 as in multiclass recipe)"
+    )
 
     split_folds = kfold_train_val_indices(n, args.n_folds, args.seed)
 
@@ -482,6 +487,7 @@ def main() -> None:
         train_idx, val_idx = tr.tolist(), va.tolist()
         result = run_single_fold(
             fold,
+            args.n_folds,
             train_idx,
             val_idx,
             data_root,
