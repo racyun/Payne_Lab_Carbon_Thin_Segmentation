@@ -70,39 +70,21 @@ Pretrained Swin backbone weights
 │                     │ (fine texture)  (small grains)  (assemblages)   (global scene)  │ │
 │                     └──┬──────────────┬────────────────┬────────────────┬─────────────┘ │
 │                        │              │                │                │               │
-│                        │ lateral 1×1  │ lateral 1×1    │ lateral 1×1    ▼               │
-│                        │              │                │         ┌────────────┐        │
-│                        │              │                │         │ PPM        │        │
-│                        │              │                │         │ (1,2,3,6   │        │
-│                        │              │                │         │  avg pool) │        │
-│                        │              │                │         └──────┬─────┘        │
-│                        │              │                │                │              │
-│                        │              │                ▼◀──── upsample ─┘              │
-│                        │              │         ┌────────────┐                         │
-│                        │              │         │ fuse + 3×3 │                         │
-│                        │              │         └──────┬─────┘                         │
-│                        │              ▼◀──── upsample ─┘                               │
-│                        │       ┌────────────┐                                          │
-│                        │       │ fuse + 3×3 │                                          │
-│                        │       └──────┬─────┘                                          │
-│                        ▼◀──── upsample ┘                                               │
-│                 ┌────────────┐                                                         │
-│                 │ fuse + 3×3 │                                                         │
-│                 └──────┬─────┘                                                         │
-│                        │                                                                │
-│                        ▼                                                                │
-│              concat all scales  ──▶  1×1 classifier  ──▶  16-channel logits            │
-│                                                                  │                      │
-│                                                                  ▼                      │
-│                                              bilinear upsample to 512×512               │
-│                                                                  │                      │
-│                                                                  ▼                      │
-│                                     cross-entropy vs. ground-truth mask                 │
+│                        ▼              ▼                ▼                ▼               │
+│              ┌───────────────────────────────────────────────────────────────┐          │
+│              │  UPerNet decoder: PPM on Stage 3 + top-down fusion w/ Stages  │          │
+│              │  0–2, so fine detail and global context are combined          │          │
+│              └───────────────────────────────┬───────────────────────────────┘          │
+│                                              ▼                                           │
+│                       per-pixel 16-class prediction (512×512)                            │
+│                                              │                                           │
+│                                              ▼                                           │
+│                       cross-entropy vs. ground-truth mask                                │
 │                                                                                          │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The top block (PPM) injects global context into the deepest, most semantic stage. The top-down FPN pathway then progressively fuses that global context back into finer-resolution features, so the per-pixel classifier sees all four scales at once. Sections 2.1 and 2.2 below explain each piece in detail.
+The decoder fuses all four Swin stages so the per-pixel classifier simultaneously sees fine texture (Stage 0) and global scene context (Stage 3) — this is the hierarchical learning that makes the model well-matched to carbonate imagery. Sections 2.1 and 2.2 below expand on each piece.
 
 ---
 
