@@ -41,6 +41,26 @@ NUM_CLASSES = 16
 IGNORE_INDEX = 255
 SCALE_BAR_CLASS_ID = 11
 BACKBONE_ID = "microsoft/swinv2-tiny-patch4-window8-256"
+
+# Label ids 0–15 (must align with NUM_CLASSES).
+CLASS_NAMES = (
+    "background",
+    "bivalves",
+    "micrite",
+    "cement",
+    "echinoderms",
+    "foraminifera",
+    "calcareous algae",
+    "peloid",
+    "unid biota",
+    "ooid",
+    "gastropods",
+    "scale bar",
+    "mollusk",
+    "ostracod",
+    "aggregate grain",
+    "brachiopod",
+)
 DEFAULT_GDRIVE_LABELED_IMG_DIR = (
     "/content/drive/My Drive/Petrographic images_ML work/labelled images_PS/labelled images_PS/my_dataset/img"
 )
@@ -107,6 +127,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gamma", type=float, default=0.5, help="StepLR gamma when scheduler=step.")
     p.add_argument("--tile_size", type=int, default=512, help="Tile edge length for ``predict_image_tiled``.")
     p.add_argument("--tile_stride", type=int, default=None, help="Stride for tiling; default = tile_size // 2.")
+    p.add_argument(
+        "--viz_samples",
+        type=int,
+        default=4,
+        help="Number of validation samples to visualize at end of training.",
+    )
     p.add_argument(
         "--backbone_checkpoint",
         type=str,
@@ -180,7 +206,7 @@ def estimate_class_weights_from_dataset(
 ) -> torch.Tensor:
     counts = torch.zeros(num_classes, dtype=torch.float64)
     for _, labels in dataset:
-        flat = labels.view(-1)
+        flat = labels.reshape(-1)
         valid = (flat != ignore_index) & (flat >= 0) & (flat < num_classes)
         if valid.any():
             binc = torch.bincount(flat[valid], minlength=num_classes).to(torch.float64)
@@ -299,6 +325,18 @@ def confusion_matrix(pred: torch.Tensor, target: torch.Tensor, num_classes: int,
         return torch.zeros(num_classes, num_classes, device=pred.device, dtype=torch.float32)
     k = (target * num_classes + pred).to(torch.int64)
     return torch.bincount(k, minlength=num_classes * num_classes).reshape(num_classes, num_classes).float()
+
+
+def print_per_class_iou(per_iou: torch.Tensor, epoch: int) -> None:
+    """Pretty-print per-class validation IoU (one line per class)."""
+    print(f"  per-class val IoU (epoch {epoch:02d}):")
+    vec = per_iou.detach().cpu()
+    for i, name in enumerate(CLASS_NAMES[: len(vec)]):
+        v = vec[i]
+        if torch.isfinite(v).item():
+            print(f"    {name} IoU: {float(v):.4f}")
+        else:
+            print(f"    {name} IoU: nan")
 
 
 def miou_from_confusion(cm: torch.Tensor) -> tuple[float, torch.Tensor]:
@@ -625,6 +663,7 @@ def main() -> None:
         print(
             f"Epoch {epoch:02d} | train {tr:.4f} | val {va_loss:.4f} | acc {va_acc:.3f} | mIoU {va_miou:.3f}"
         )
+        print_per_class_iou(per_iou, epoch)
         with per_class_log_path.open("a", encoding="utf-8") as f:
             vals = ",".join(f"{float(v):.6f}" if torch.isfinite(v) else "nan" for v in per_iou.detach().cpu())
             f.write(f"{epoch},{vals}\n")
@@ -646,53 +685,87 @@ def main() -> None:
         return
 
     model.eval()
-    with torch.no_grad():
-        img, _ = val_ds[0]
-        h, w = img.shape[-2:]
-        if h > crop or w > crop:
-            pred = predict_image_tiled(
-                model,
-                img.unsqueeze(0),
-                device,
-                tile_size=args.tile_size,
-                tile_stride=args.tile_stride,
-            )
-        else:
-            logits = model(pixel_values=img.unsqueeze(0).to(device)).logits
-            logits = F.interpolate(logits, size=img.shape[-2:], mode="bilinear", align_corners=False)
-            pred = logits.argmax(dim=1)[0].cpu()
-
-    pred_np = pred.numpy().astype(np.uint8)
-    vis_path = out_dir / "prediction_vis.png"
-    colorize_mask(pred_np).save(vis_path)
+    n_viz = max(1, min(args.viz_samples, len(val_ds)))
+    viz_dir = out_dir / "prediction_viz"
+    viz_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         import matplotlib.pyplot as plt
 
-        orig = denorm_to_uint8(img)
-        color_mask = np.array(Image.open(vis_path))
-        alpha = 0.55
-        overlay = (alpha * color_mask + (1 - alpha) * orig).astype(np.uint8)
+        with torch.no_grad():
+            for i in range(n_viz):
+                img, gt_mask = val_ds[i]
+                h, w = img.shape[-2:]
+                if h > crop or w > crop:
+                    pred = predict_image_tiled(
+                        model,
+                        img.unsqueeze(0),
+                        device,
+                        tile_size=args.tile_size,
+                        tile_stride=args.tile_stride,
+                    )
+                else:
+                    logits = model(pixel_values=img.unsqueeze(0).to(device)).logits
+                    logits = F.interpolate(logits, size=img.shape[-2:], mode="bilinear", align_corners=False)
+                    pred = logits.argmax(dim=1)[0].cpu()
 
-        plt.figure(figsize=(18, 6))
-        plt.subplot(1, 3, 1)
-        plt.title("Original")
-        plt.imshow(orig)
-        plt.axis("off")
-        plt.subplot(1, 3, 2)
-        plt.title("Prediction (colorized)")
-        plt.imshow(color_mask)
-        plt.axis("off")
-        plt.subplot(1, 3, 3)
-        plt.title("Overlay")
-        plt.imshow(overlay)
-        plt.axis("off")
-        plt.tight_layout()
-        plt.savefig(out_dir / "prediction_overlay.png", dpi=150)
-        plt.close()
-        print(f"[viz] Saved {vis_path} and {out_dir / 'prediction_overlay.png'}")
+                pred_np = pred.numpy().astype(np.uint8)
+                gt_np = gt_mask.cpu().numpy().astype(np.uint8)
+                pred_color = np.array(colorize_mask(pred_np))
+                gt_color = np.array(colorize_mask(gt_np))
+                orig = denorm_to_uint8(img)
+                alpha = 0.55
+                overlay = (alpha * pred_color + (1 - alpha) * orig).astype(np.uint8)
+
+                # Save raw predicted color mask for compatibility with previous output style.
+                pred_path = viz_dir / f"prediction_{i:02d}.png"
+                Image.fromarray(pred_color).save(pred_path)
+
+                # Save four-panel figure: original, ground-truth mask, prediction, overlay.
+                panel_path = viz_dir / f"panel_{i:02d}.png"
+                plt.figure(figsize=(20, 6))
+                plt.subplot(1, 4, 1)
+                plt.title("Original")
+                plt.imshow(orig)
+                plt.axis("off")
+                plt.subplot(1, 4, 2)
+                plt.title("Ground Truth Mask")
+                plt.imshow(gt_color)
+                plt.axis("off")
+                plt.subplot(1, 4, 3)
+                plt.title("Prediction")
+                plt.imshow(pred_color)
+                plt.axis("off")
+                plt.subplot(1, 4, 4)
+                plt.title("Overlay")
+                plt.imshow(overlay)
+                plt.axis("off")
+                plt.tight_layout()
+                plt.savefig(panel_path, dpi=150)
+                plt.close()
+
+        print(f"[viz] Saved {n_viz} prediction masks and {n_viz} 4-panel figures under {viz_dir}")
     except ImportError:
-        print(f"[viz] Saved {vis_path} (matplotlib not installed; skipped overlay figure)")
+        # Fallback: save only raw predicted masks if matplotlib is unavailable.
+        with torch.no_grad():
+            for i in range(n_viz):
+                img, _ = val_ds[i]
+                h, w = img.shape[-2:]
+                if h > crop or w > crop:
+                    pred = predict_image_tiled(
+                        model,
+                        img.unsqueeze(0),
+                        device,
+                        tile_size=args.tile_size,
+                        tile_stride=args.tile_stride,
+                    )
+                else:
+                    logits = model(pixel_values=img.unsqueeze(0).to(device)).logits
+                    logits = F.interpolate(logits, size=img.shape[-2:], mode="bilinear", align_corners=False)
+                    pred = logits.argmax(dim=1)[0].cpu()
+                pred_np = pred.numpy().astype(np.uint8)
+                Image.fromarray(np.array(colorize_mask(pred_np))).save(viz_dir / f"prediction_{i:02d}.png")
+        print(f"[viz] matplotlib not installed; saved {n_viz} predicted masks under {viz_dir}")
 
 
 if __name__ == "__main__":
