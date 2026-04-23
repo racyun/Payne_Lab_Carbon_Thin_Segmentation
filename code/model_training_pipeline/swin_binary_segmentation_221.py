@@ -23,6 +23,11 @@ import math
 from pathlib import Path
 
 import numpy as np
+
+# Progress: heavy imports can take 1–4+ minutes on a cold Colab (Drive + first HF cache).
+# Print only when this file is the entry point so `import swin_binary_segmentation_221` stays quiet.
+if __name__ == "__main__":
+    print("[binary] loading PyTorch + CUDA stack (wait…)", flush=True)
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
@@ -32,9 +37,16 @@ from torchvision.transforms.v2 import CenterCrop, Compose, RandomCrop, RandomHor
 from torchvision.transforms.v2 import functional as V2F
 from tqdm.auto import tqdm
 
+if __name__ == "__main__":
+    print(f"[binary] torch {torch.__version__}; loading HuggingFace UPerNet…", flush=True)
 from transformers import UperNetConfig, UperNetForSemanticSegmentation
 
+if __name__ == "__main__":
+    print("[binary] loading swin_training_pipeline_221 helpers (second big import)…", flush=True)
 from swin_training_pipeline_221 import evaluate, set_seed, train_one_epoch
+
+if __name__ == "__main__":
+    print("[binary] imports finished; setting up data and model.", flush=True)
 
 NUM_BINARY_CLASSES = 2
 IGNORE_INDEX = 255
