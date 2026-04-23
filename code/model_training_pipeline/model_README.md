@@ -9,6 +9,101 @@ The pipeline has two training stages, implemented in two scripts:
 
 The two stages are connected by a weight-transfer step: the backbone learned in stage (1) is loaded into the encoder of stage (2) via `--backbone_checkpoint`, so stage (2) starts from a backbone that already "understands" carbonate textures rather than a generic ImageNet one.
 
+### High-level overview
+
+```
+Stage 1: Self-supervised Pretraining (Masked Image Modeling)
+───────────────────────────────────────────────────────────
+
+Unlabeled carbonate thin sections (no masks needed)
+       │
+       ▼
+ SwinV2-Tiny encoder learns to reconstruct
+ hidden 16 px blocks (~55% of the image)
+       │
+       ▼
+ Encoder now "understands" carbonate textures,
+ grain morphology, and matrix/cement patterns
+
+
+Stage 2: Supervised Finetuning (Swin + UPerNet)
+───────────────────────────────────────────────
+
+Pretrained Swin backbone weights
+       │
+       ▼
+ Fine-tune on labeled 16-class masks
+ (cross-entropy, optional class weights)
+       │
+       ▼
+ Per-pixel predictions across 16 carbonate
+ classes (background, bivalves, micrite, cement,
+ echinoderms, forams, calc. algae, peloids,
+ unid biota, ooids, gastropods, scale bar,
+ mollusks, ostracods, aggregate grains, brachiopods)
+```
+
+### End-to-end architecture (detailed)
+
+```
+┌──────────────────────────── STAGE 1: Masked SSL Pretraining ────────────────────────────┐
+│                                                                                          │
+│   Unlabeled     ┌──────────────┐    ┌────────────────┐    ┌──────────────┐              │
+│   carbonate ──▶ │  Block mask  │──▶ │ SwinV2-Tiny    │──▶ │ ConvTranspose│──▶ recon     │
+│   crop          │  ~55% hidden │    │ encoder (4     │    │ decoder      │    512×512   │
+│   512×512       │  16 px blocks│    │ hierarchical   │    │ (discarded   │      │       │
+│                 └──────────────┘    │ stages)        │    │  after SSL)  │      │       │
+│                                     └────────────────┘    └──────────────┘      │       │
+│                                                                                 ▼       │
+│                                                   masked L1 loss on hidden pixels only  │
+│                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          │  transfer backbone_state
+                                          ▼
+┌────────────────────── STAGE 2: Supervised Segmentation Finetuning ──────────────────────┐
+│                                                                                          │
+│                     ┌─────────────────────── SwinV2-Tiny encoder ─────────────────────┐ │
+│                     │                                                                  │ │
+│   Labeled image ──▶ │ Stage 0         Stage 1         Stage 2         Stage 3        │ │
+│   512×512           │ 128×128, C      64×64, 2C       32×32, 4C       16×16, 8C      │ │
+│                     │ (fine texture)  (small grains)  (assemblages)   (global scene)  │ │
+│                     └──┬──────────────┬────────────────┬────────────────┬─────────────┘ │
+│                        │              │                │                │               │
+│                        │ lateral 1×1  │ lateral 1×1    │ lateral 1×1    ▼               │
+│                        │              │                │         ┌────────────┐        │
+│                        │              │                │         │ PPM        │        │
+│                        │              │                │         │ (1,2,3,6   │        │
+│                        │              │                │         │  avg pool) │        │
+│                        │              │                │         └──────┬─────┘        │
+│                        │              │                │                │              │
+│                        │              │                ▼◀──── upsample ─┘              │
+│                        │              │         ┌────────────┐                         │
+│                        │              │         │ fuse + 3×3 │                         │
+│                        │              │         └──────┬─────┘                         │
+│                        │              ▼◀──── upsample ─┘                               │
+│                        │       ┌────────────┐                                          │
+│                        │       │ fuse + 3×3 │                                          │
+│                        │       └──────┬─────┘                                          │
+│                        ▼◀──── upsample ┘                                               │
+│                 ┌────────────┐                                                         │
+│                 │ fuse + 3×3 │                                                         │
+│                 └──────┬─────┘                                                         │
+│                        │                                                                │
+│                        ▼                                                                │
+│              concat all scales  ──▶  1×1 classifier  ──▶  16-channel logits            │
+│                                                                  │                      │
+│                                                                  ▼                      │
+│                                              bilinear upsample to 512×512               │
+│                                                                  │                      │
+│                                                                  ▼                      │
+│                                     cross-entropy vs. ground-truth mask                 │
+│                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The top block (PPM) injects global context into the deepest, most semantic stage. The top-down FPN pathway then progressively fuses that global context back into finer-resolution features, so the per-pixel classifier sees all four scales at once. Sections 2.1 and 2.2 below explain each piece in detail.
+
 ---
 
 ## 1. Stage-1 — Masked self-supervised pretraining
