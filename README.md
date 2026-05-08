@@ -1,6 +1,6 @@
 # Payne Lab: Swin Transformer and Automated Data Labeling
 
-We are currently developing AI for semantic segmentation of carbonate thin section, supporting paleobiology and mass-extinction research. We are deploying four models across labeled and unlabeled high-resolution petrographic datasets from the Cretaceous and the Permian–Triassic, with two manuscripts in preparation. My primary contributions include building the end-to-end modeling pipeline, designing automated methods to improve training labels, and co-drafting the manuscripts.
+We are currently developing AI for semantic segmentation of carbonate thin section, supporting paleobiology and mass-extinction research. We are deploying four models across labeled and unlabeled high-resolution petrographic datasets from the Cretaceous and the Permian–Triassic, with two manuscripts in preparation.
 
 This repository contains a representative sample of my work in the Payne Paleobiology Lab, organized around two core components:
 
