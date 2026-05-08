@@ -10,8 +10,6 @@ The training pipeline for one of the four models, featuring a novel use of a Swi
 2) **Automated labeling and mask refinement.**
 Due to the dense, information-rich nature of the images, as well as scarcity of labels, a large part of our work focuses on automated training-data labeling. This section includes scripts for an automated labeling scheme designed to improve the quality of our limited ground-truth annotations, along with relabeling utilities and side-by-side visualizations of the original versus refined masks.
 
-Both components draw from the same data directory, titled **carbonate_imgs_and_masks**.
-
 Note on reproducibility (Colab): All work in this repository was developed and run in Google Colab, so I’ve linked the Colab notebooks directly below (rather than converting everything into local scripts and risking breaking the workflow). I’ve also included the corresponding .py versions in the repo for convenience. **To whom it may concern—if you download the sample data in this repo and upload it to your own Google Drive, the notebook paths are already set up so you can run everything end-to-end in Colab.**
 
 **Google Drive notebooks and data directory: https://drive.google.com/drive/folders/1d1LSprCOvKxIvT1lskmYvRLjiXjL2ho-?usp=sharing**
