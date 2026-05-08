@@ -8,7 +8,7 @@ This repository contains a representative sample of our work thus far, organized
 The training pipeline for one of the four models, featuring a novel use of a Swin Transformer backbone as a framework for hierarchical feature learning.
    
 2) **Automated labeling and mask refinement.**
-Due to the dense, information-rich nature of the images, as well as scarcity of labels, a large part of my work focuses on automated training-data labeling. This section includes scripts for an automated labeling scheme I designed to improve the quality of our limited ground-truth annotations, along with relabeling utilities and side-by-side visualizations of the original versus refined masks.
+Due to the dense, information-rich nature of the images, as well as scarcity of labels, a large part of our work focuses on automated training-data labeling. This section includes scripts for an automated labeling scheme designed to improve the quality of our limited ground-truth annotations, along with relabeling utilities and side-by-side visualizations of the original versus refined masks.
 
 Both components draw from the same data directory, titled **carbonate_imgs_and_masks**.
 
