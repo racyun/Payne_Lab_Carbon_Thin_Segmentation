@@ -2,7 +2,7 @@
 
 We are currently developing AI for semantic segmentation of carbonate thin section, supporting paleobiology and mass-extinction research. We are deploying four models across labeled and unlabeled high-resolution petrographic datasets from the Cretaceous and the Permian–Triassic, with two manuscripts in preparation.
 
-This repository contains a representative sample of my work in the Payne Paleobiology Lab, organized around two core components:
+This repository contains a representative sample of our work thus far, organized around two core components:
 
 1) **Model training pipeline.**
 The training pipeline for one of the four models, featuring a novel use of a Swin Transformer backbone as a framework for hierarchical feature learning.
