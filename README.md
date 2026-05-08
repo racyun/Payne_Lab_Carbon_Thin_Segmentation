@@ -1,4 +1,4 @@
-# Payne Lab: Swin Transformer and Automated Data Labeling
+# Payne Lab: Carbonate Petropgraphy Semantic Segmentation
 
 We are currently developing AI for semantic segmentation of carbonate thin section, supporting paleobiology and mass-extinction research. We are deploying four models across labeled and unlabeled high-resolution petrographic datasets from the Cretaceous and the Permian–Triassic, with two manuscripts in preparation.
 
