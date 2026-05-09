@@ -802,6 +802,10 @@ def main() -> None:
     with per_class_log_path.open("w", encoding="utf-8") as f:
         f.write("epoch," + ",".join(f"class_{i}" for i in range(NUM_CLASSES)) + "\n")
 
+    # In-memory history for end-of-run W&B composite chart + table.
+    epoch_history: list[int] = []
+    per_class_history: list[list[float]] = [[] for _ in range(NUM_CLASSES)]
+
     for epoch in range(1, args.epochs + 1):
         tr = train_one_epoch(
             model,
@@ -833,6 +837,13 @@ def main() -> None:
         with per_class_log_path.open("a", encoding="utf-8") as f:
             vals = ",".join(f"{float(v):.6f}" if torch.isfinite(v) else "nan" for v in per_iou.detach().cpu())
             f.write(f"{epoch},{vals}\n")
+
+        # Track per-class IoU history (used for the end-of-run composite chart + table).
+        epoch_history.append(epoch)
+        per_iou_cpu = per_iou.detach().cpu()
+        for i in range(NUM_CLASSES):
+            v = per_iou_cpu[i].item()
+            per_class_history[i].append(float(v) if torch.isfinite(per_iou_cpu[i]).item() else float("nan"))
 
         # ------- Weights & Biases per-epoch metrics -------
         if wandb_run is not None:
@@ -868,7 +879,38 @@ def main() -> None:
                 wandb_run.summary["best_val_mIoU"] = best_miou
                 wandb_run.summary["best_epoch"] = epoch
 
-    if wandb_run is not None:
+    # ------- End-of-run W&B summary artifacts: composite line chart + table -------
+    if wandb_run is not None and epoch_history:
+        import wandb as _wandb
+
+        # Composite chart: all classes on one panel, one line per class.
+        # NaN values are replaced with None so missing classes are dropped from the line.
+        ys_per_class = [
+            [None if (isinstance(v, float) and (v != v)) else v for v in series]
+            for series in per_class_history
+        ]
+        try:
+            line_chart = _wandb.plot.line_series(
+                xs=epoch_history,
+                ys=ys_per_class,
+                keys=list(CLASS_NAMES[:NUM_CLASSES]),
+                title="Per-class validation IoU across epochs",
+                xname="epoch",
+            )
+            wandb_run.log({"val_iou/per_class_lines": line_chart})
+        except Exception as exc:  # noqa: BLE001 — best-effort, don't kill the run.
+            print(f"[wandb] line_series chart skipped: {exc}")
+
+        # Sortable table: rows = epochs, columns = epoch + each class IoU.
+        try:
+            tbl = _wandb.Table(columns=["epoch"] + list(CLASS_NAMES[:NUM_CLASSES]))
+            for row_idx, ep in enumerate(epoch_history):
+                row = [ep] + [per_class_history[c][row_idx] for c in range(NUM_CLASSES)]
+                tbl.add_data(*row)
+            wandb_run.log({"val_iou/per_class_table": tbl})
+        except Exception as exc:  # noqa: BLE001
+            print(f"[wandb] per-class table skipped: {exc}")
+
         wandb_run.finish()
 
     if args.no_viz:
