@@ -33,6 +33,12 @@ from tqdm.auto import tqdm
 
 from transformers import UperNetConfig, UperNetForSemanticSegmentation
 
+try:
+    import wandb  # noqa: F401
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Constants (carbonate labeling: 0–15 => 16 logits)
 # ---------------------------------------------------------------------------
@@ -93,6 +99,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=0,
+        help="Linear LR warmup over the first N epochs (0 disables). Combines with --scheduler.",
+    )
+    p.add_argument(
+        "--loss_type",
+        type=str,
+        default="ce",
+        choices=["ce", "focal"],
+        help="Loss function. 'ce' = standard cross-entropy; 'focal' = focal CE for imbalance.",
+    )
+    p.add_argument(
+        "--focal_gamma",
+        type=float,
+        default=2.0,
+        help="Focusing parameter for focal loss (only used when --loss_type=focal).",
+    )
     p.add_argument("--crop", type=int, default=512, help="Train random crop and val center crop size.")
     p.add_argument("--val_frac", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=1337)
@@ -140,6 +165,32 @@ def parse_args() -> argparse.Namespace:
         help="Optional SSL checkpoint path; loads checkpoint['backbone_state'] into model.backbone.",
     )
     p.add_argument("--no_viz", action="store_true", help="Skip matplotlib overlay at end of training.")
+    # Weights & Biases logging.
+    p.add_argument(
+        "--wandb_project",
+        type=str,
+        default=None,
+        help="W&B project name. If unset, W&B logging is disabled.",
+    )
+    p.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="Optional W&B run name (auto-generated if unset).",
+    )
+    p.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="Optional W&B entity (team or user).",
+    )
+    p.add_argument(
+        "--wandb_mode",
+        type=str,
+        default="online",
+        choices=["online", "offline", "disabled"],
+        help="W&B mode (online uploads live; offline writes locally; disabled = no logging).",
+    )
     return p.parse_args()
 
 
@@ -350,6 +401,50 @@ def miou_from_confusion(cm: torch.Tensor) -> tuple[float, torch.Tensor]:
     return miou, iou
 
 
+def focal_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    weight: torch.Tensor | None,
+    ignore_index: int,
+    gamma: float,
+) -> torch.Tensor:
+    """Focal cross-entropy: (1 - p_t)^gamma * CE.
+
+    Down-weights pixels the model already classifies confidently, focusing
+    gradient on the hard / under-learned classes. Reduces to plain weighted
+    CE when gamma == 0.
+    """
+    ce = F.cross_entropy(
+        logits, labels, weight=weight, ignore_index=ignore_index, reduction="none"
+    )
+    pt = torch.exp(-ce)
+    focal = (1.0 - pt).clamp(min=0.0).pow(gamma) * ce
+    valid = labels != ignore_index
+    if valid.any():
+        return focal[valid].mean()
+    return focal.mean()
+
+
+def compute_seg_loss(
+    out,
+    labels: torch.Tensor,
+    class_weights: torch.Tensor | None,
+    ignore_index: int,
+    loss_type: str,
+    focal_gamma: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (loss, logits_at_label_resolution)."""
+    logits = out.logits
+    logits = F.interpolate(logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+    if loss_type == "focal":
+        loss = focal_cross_entropy(logits, labels, class_weights, ignore_index, focal_gamma)
+    else:
+        loss = F.cross_entropy(
+            logits, labels, weight=class_weights, ignore_index=ignore_index
+        )
+    return loss, logits
+
+
 def train_one_epoch(
     model,
     loader,
@@ -360,6 +455,8 @@ def train_one_epoch(
     ignore_index: int,
     class_weights: torch.Tensor | None,
     scheduler=None,
+    loss_type: str = "ce",
+    focal_gamma: float = 2.0,
 ) -> float:
     model.train()
     total, n = 0.0, 0
@@ -369,14 +466,15 @@ def train_one_epoch(
         labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
 
-        if class_weights is None:
+        # Use HF's built-in CE loss only when nothing custom is requested.
+        if class_weights is None and loss_type == "ce":
             out = model(pixel_values=imgs, labels=labels)
             loss = out.loss
         else:
             out = model(pixel_values=imgs)
-            logits = out.logits
-            logits = F.interpolate(logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
-            loss = F.cross_entropy(logits, labels, weight=class_weights, ignore_index=ignore_index)
+            loss, _ = compute_seg_loss(
+                out, labels, class_weights, ignore_index, loss_type, focal_gamma
+            )
 
         loss.backward()
         optimizer.step()
@@ -401,6 +499,8 @@ def evaluate(
     num_classes: int,
     ignore_index: int,
     class_weights: torch.Tensor | None,
+    loss_type: str = "ce",
+    focal_gamma: float = 2.0,
 ) -> tuple[float, float, float, torch.Tensor]:
     """Returns val_loss, pixel_acc, mIoU (from full-val confusion matrix), per-class IoU vector."""
     model.eval()
@@ -412,15 +512,14 @@ def evaluate(
         imgs = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        if class_weights is None:
+        if class_weights is None and loss_type == "ce":
             out = model(pixel_values=imgs, labels=labels)
             loss = out.loss
-            logits = out.logits
         else:
             out = model(pixel_values=imgs)
-            logits = out.logits
-            logits_up = F.interpolate(logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
-            loss = F.cross_entropy(logits_up, labels, weight=class_weights, ignore_index=ignore_index)
+            loss, _ = compute_seg_loss(
+                out, labels, class_weights, ignore_index, loss_type, focal_gamma
+            )
 
         logits = F.interpolate(out.logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
         preds = logits.argmax(dim=1)
@@ -633,11 +732,69 @@ def main() -> None:
         load_ssl_backbone_checkpoint(model, args.backbone_checkpoint)
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = None
+
+    # Build the main scheduler (post-warmup), then optionally chain a linear-warmup
+    # SequentialLR in front of it.
+    main_sched: torch.optim.lr_scheduler._LRScheduler | None = None
+    main_epochs = max(1, args.epochs - max(0, args.warmup_epochs))
     if args.scheduler == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+        main_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=main_epochs)
     elif args.scheduler == "step":
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(1, args.step_size), gamma=args.gamma)
+        main_sched = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=max(1, args.step_size), gamma=args.gamma
+        )
+
+    if args.warmup_epochs > 0:
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-3, end_factor=1.0, total_iters=args.warmup_epochs
+        )
+        if main_sched is None:
+            scheduler = warmup_sched
+        else:
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_sched, main_sched],
+                milestones=[args.warmup_epochs],
+            )
+    else:
+        scheduler = main_sched
+
+    # ------------------------------------------------------------------
+    # Weights & Biases setup (logged once, then per-epoch metrics below).
+    # ------------------------------------------------------------------
+    wandb_run = None
+    if args.wandb_project and args.wandb_mode != "disabled":
+        if not _WANDB_AVAILABLE:
+            print("[wandb] wandb not installed; skipping logging. `pip install wandb` to enable.")
+        else:
+            import wandb as _wandb  # local re-import for clarity
+            wandb_run = _wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name,
+                mode=args.wandb_mode,
+                config={
+                    "stage": "finetune",
+                    "backbone_id": BACKBONE_ID,
+                    "num_classes": NUM_CLASSES,
+                    "epochs": args.epochs,
+                    "batch_size": args.batch_size,
+                    "lr": args.lr,
+                    "weight_decay": args.weight_decay,
+                    "warmup_epochs": args.warmup_epochs,
+                    "scheduler": args.scheduler,
+                    "loss_type": args.loss_type,
+                    "focal_gamma": args.focal_gamma,
+                    "auto_class_weights": args.auto_class_weights,
+                    "class_weights_path": args.class_weights,
+                    "ignore_scale_bar": args.ignore_scale_bar,
+                    "crop": args.crop,
+                    "val_frac": args.val_frac,
+                    "seed": args.seed,
+                    "ssl_backbone_checkpoint": args.backbone_checkpoint,
+                },
+            )
+            print(f"[wandb] logging to project={args.wandb_project} run={wandb_run.name}")
 
     best_miou = -1.0
     ckpt_path = out_dir / "best_upernet_swinv2.pth"
@@ -656,9 +813,18 @@ def main() -> None:
             IGNORE_INDEX,
             class_weights,
             scheduler,
+            loss_type=args.loss_type,
+            focal_gamma=args.focal_gamma,
         )
         va_loss, va_acc, va_miou, per_iou = evaluate(
-            model, val_loader, device, NUM_CLASSES, IGNORE_INDEX, class_weights
+            model,
+            val_loader,
+            device,
+            NUM_CLASSES,
+            IGNORE_INDEX,
+            class_weights,
+            loss_type=args.loss_type,
+            focal_gamma=args.focal_gamma,
         )
         print(
             f"Epoch {epoch:02d} | train {tr:.4f} | val {va_loss:.4f} | acc {va_acc:.3f} | mIoU {va_miou:.3f}"
@@ -667,6 +833,24 @@ def main() -> None:
         with per_class_log_path.open("a", encoding="utf-8") as f:
             vals = ",".join(f"{float(v):.6f}" if torch.isfinite(v) else "nan" for v in per_iou.detach().cpu())
             f.write(f"{epoch},{vals}\n")
+
+        # ------- Weights & Biases per-epoch metrics -------
+        if wandb_run is not None:
+            current_lr = optimizer.param_groups[0]["lr"]
+            log_payload = {
+                "epoch": epoch,
+                "lr": current_lr,
+                "train/loss": tr,
+                "val/loss": va_loss,
+                "val/pixel_acc": va_acc,
+                "val/mIoU": va_miou,
+            }
+            for i, name in enumerate(CLASS_NAMES[: per_iou.numel()]):
+                v = per_iou[i].item()
+                if torch.isfinite(per_iou[i]).item():
+                    log_payload[f"val_iou/{i:02d}_{name}"] = v
+            wandb_run.log(log_payload, step=epoch)
+
         if va_miou > best_miou:
             best_miou = va_miou
             torch.save(
@@ -680,6 +864,12 @@ def main() -> None:
                 ckpt_path,
             )
             print(f"  saved {ckpt_path}")
+            if wandb_run is not None:
+                wandb_run.summary["best_val_mIoU"] = best_miou
+                wandb_run.summary["best_epoch"] = epoch
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
     if args.no_viz:
         return

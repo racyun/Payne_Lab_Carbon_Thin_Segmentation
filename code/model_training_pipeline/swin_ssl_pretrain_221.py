@@ -31,6 +31,12 @@ from tqdm.auto import tqdm
 from transformers import Swinv2Model
 import matplotlib.pyplot as plt
 
+try:
+    import wandb  # noqa: F401
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 BACKBONE_ID = "microsoft/swinv2-tiny-patch4-window8-256"
@@ -63,12 +69,12 @@ def parse_args() -> argparse.Namespace:
         help="Google Drive root containing the three unlabeled subfolders.",
     )
     p.add_argument("--output_dir", type=str, default=".", help="Directory for SSL checkpoints.")
-    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--crop", type=int, default=512, help="Random crop size for SSL training.")
     p.add_argument("--mask_patch", type=int, default=16, help="Masking block size in pixels.")
-    p.add_argument("--mask_ratio", type=float, default=0.55, help="Fraction of mask blocks to hide.")
+    p.add_argument("--mask_ratio", type=float, default=0.70, help="Fraction of mask blocks to hide.")
     p.add_argument("--lr", type=float, default=1.5e-4)
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--warmup_epochs", type=int, default=10)
@@ -89,6 +95,32 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="Number of batch items shown in each reconstruction preview.",
+    )
+    # Weights & Biases logging.
+    p.add_argument(
+        "--wandb_project",
+        type=str,
+        default=None,
+        help="W&B project name. If unset, W&B logging is disabled.",
+    )
+    p.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="Optional W&B run name (auto-generated if unset).",
+    )
+    p.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="Optional W&B entity (team or user).",
+    )
+    p.add_argument(
+        "--wandb_mode",
+        type=str,
+        default="online",
+        choices=["online", "offline", "disabled"],
+        help="W&B mode (online uploads live; offline writes locally; disabled = no logging).",
     )
     return p.parse_args()
 
@@ -325,6 +357,38 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
     scaler = GradScaler(device="cuda", enabled=(args.amp and on_gpu))
 
+    # ------------------------------------------------------------------
+    # Weights & Biases setup.
+    # ------------------------------------------------------------------
+    wandb_run = None
+    if args.wandb_project and args.wandb_mode != "disabled":
+        if not _WANDB_AVAILABLE:
+            print("[wandb] wandb not installed; skipping logging. `pip install wandb` to enable.")
+        else:
+            import wandb as _wandb
+            wandb_run = _wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name,
+                mode=args.wandb_mode,
+                config={
+                    "stage": "ssl_pretrain",
+                    "backbone_id": BACKBONE_ID,
+                    "epochs": args.epochs,
+                    "batch_size": args.batch_size,
+                    "lr": args.lr,
+                    "weight_decay": args.weight_decay,
+                    "warmup_epochs": args.warmup_epochs,
+                    "crop": args.crop,
+                    "mask_patch": args.mask_patch,
+                    "mask_ratio": args.mask_ratio,
+                    "amp": args.amp,
+                    "seed": args.seed,
+                    "num_unlabeled_images": len(ds),
+                },
+            )
+            print(f"[wandb] logging to project={args.wandb_project} run={wandb_run.name}")
+
     start_epoch = 0
     best_loss = float("inf")
     if args.resume:
@@ -386,6 +450,16 @@ def main() -> None:
         epoch_loss = running / max(1, steps)
         print(f"[ssl] epoch {epoch + 1:03d} | loss {epoch_loss:.5f} | lr {lr:.2e}")
 
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "epoch": epoch + 1,
+                    "lr": lr,
+                    "ssl/train_loss": epoch_loss,
+                },
+                step=epoch + 1,
+            )
+
         if args.save_recon_every > 0 and ((epoch + 1) % args.save_recon_every == 0) and preview_cache is not None:
             p_imgs, p_masked, p_pred, p_mask = preview_cache
             save_reconstruction_preview(
@@ -424,6 +498,10 @@ def main() -> None:
 
         if (epoch + 1) % args.checkpoint_every == 0:
             torch.save(ckpt, out_dir / f"ssl_swinv2_epoch_{epoch + 1:03d}.pth")
+
+    if wandb_run is not None:
+        wandb_run.summary["best_loss"] = best_loss
+        wandb_run.finish()
 
     print("[ssl] Done.")
 
