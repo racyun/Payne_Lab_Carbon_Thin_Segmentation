@@ -68,10 +68,10 @@ CLASS_NAMES = (
     "brachiopod",
 )
 DEFAULT_GDRIVE_LABELED_IMG_DIR = (
-    "/content/drive/My Drive/Petrographic images_ML work/labelled images_PS/labelled images_PS/my_dataset/img"
+    "/content/drive/My Drive/Petrographic images_ML work/labelled images_PS/labelledDataset_02032026/my_dataset/img"
 )
 DEFAULT_GDRIVE_LABELED_MASK_DIR = (
-    "/content/drive/My Drive/Petrographic images_ML work/labelled images_PS/labelled images_PS/my_dataset/masks_machine"
+    "/content/drive/My Drive/Petrographic images_ML work/labelled images_PS/labelledDataset_02032026/my_dataset/masks_machine"
 )
 
 
