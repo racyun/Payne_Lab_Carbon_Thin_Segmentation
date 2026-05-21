@@ -392,7 +392,9 @@ def main() -> None:
     start_epoch = 0
     best_loss = float("inf")
     if args.resume:
-        ckpt = torch.load(args.resume, map_location="cpu")
+        # weights_only=False: our checkpoints contain numpy scalars (e.g. best_loss);
+        # PyTorch 2.6+ refuses to unpickle those under the new weights_only=True default.
+        ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         if "scaler_state" in ckpt and scaler.is_enabled():

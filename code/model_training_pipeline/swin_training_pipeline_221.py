@@ -228,7 +228,9 @@ def load_ssl_backbone_checkpoint(model: UperNetForSemanticSegmentation, checkpoi
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"backbone checkpoint not found: {ckpt_path}")
 
-    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+    # weights_only=False: SSL checkpoints written by swin_ssl_pretrain_221.py contain
+    # numpy scalars; PyTorch 2.6+ refuses to unpickle those under weights_only=True.
+    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     if "backbone_state" in ckpt and isinstance(ckpt["backbone_state"], dict):
         ssl_sd = ckpt["backbone_state"]
     elif "model_state" in ckpt and isinstance(ckpt["model_state"], dict):
