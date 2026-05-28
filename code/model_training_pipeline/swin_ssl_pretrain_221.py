@@ -403,13 +403,41 @@ def main() -> None:
         # weights_only=False: our checkpoints contain numpy scalars (e.g. best_loss);
         # PyTorch 2.6+ refuses to unpickle those under the new weights_only=True default.
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
-        model.load_state_dict(ckpt["model_state"])
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-        if "scaler_state" in ckpt and scaler.is_enabled():
-            scaler.load_state_dict(ckpt["scaler_state"])
-        start_epoch = int(ckpt.get("epoch", -1)) + 1
-        best_loss = float(ckpt.get("best_loss", best_loss))
-        print(f"[ssl] Resumed from {args.resume} at epoch {start_epoch}")
+        saved_epoch = int(ckpt.get("epoch", -1))  # zero-indexed
+        next_epoch = saved_epoch + 1
+        if next_epoch >= args.epochs:
+            # Previous run already completed the requested target. Archive the
+            # old artifacts under a timestamped subfolder so they aren't
+            # overwritten, then start a fresh run from epoch 0.
+            import datetime
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_dir = out_dir / f"archive_complete_e{next_epoch}_{stamp}"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            archived = 0
+            for pattern in (
+                "ssl_swinv2_last.pth",
+                "ssl_swinv2_best.pth",
+                "ssl_swinv2_epoch_*.pth",
+            ):
+                for p in out_dir.glob(pattern):
+                    p.rename(archive_dir / p.name)
+                    archived += 1
+            recon_dir = out_dir / "recon_previews"
+            if recon_dir.is_dir() and any(recon_dir.iterdir()):
+                recon_dir.rename(archive_dir / "recon_previews")
+                archived += 1
+            print(
+                f"[ssl] Previous run already completed {next_epoch} >= --epochs {args.epochs} epochs. "
+                f"Archived {archived} artifact(s) to {archive_dir.name}. Starting fresh from epoch 0."
+            )
+        else:
+            model.load_state_dict(ckpt["model_state"])
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+            if "scaler_state" in ckpt and scaler.is_enabled():
+                scaler.load_state_dict(ckpt["scaler_state"])
+            start_epoch = next_epoch
+            best_loss = float(ckpt.get("best_loss", best_loss))
+            print(f"[ssl] Resumed from {args.resume} at epoch {start_epoch}")
 
     for epoch in range(start_epoch, args.epochs):
         lr = cosine_lr(args.lr, epoch, args.epochs, args.warmup_epochs)
