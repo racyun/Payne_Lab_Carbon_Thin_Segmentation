@@ -80,6 +80,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup_epochs", type=int, default=10)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--checkpoint_every", type=int, default=5)
+    p.add_argument(
+        "--save_last_every",
+        type=int,
+        default=1,
+        help="Save ssl_swinv2_last.pth every N epochs (default 1 = every epoch). "
+        "Increase to 5+ to cut Drive-write stalls when Drive FUSE is slow; you only "
+        "lose up to N-1 epochs of progress on a runtime crash before the next save.",
+    )
     p.add_argument("--resume", type=str, default=None, help="Optional checkpoint path to resume SSL training.")
     p.add_argument("--amp", action="store_true", help="Enable AMP mixed precision.")
     p.add_argument("--max_steps_per_epoch", type=int, default=0, help="0 means full epoch.")
@@ -490,8 +498,14 @@ def main() -> None:
         if scaler.is_enabled():
             ckpt["scaler_state"] = scaler.state_dict()
 
+        # Save the resume-checkpoint only every --save_last_every epochs (default 1).
+        # On the final epoch, always save so the run ends in a resumable state.
         last_path = out_dir / "ssl_swinv2_last.pth"
-        torch.save(ckpt, last_path)
+        is_final_epoch = (epoch + 1) == args.epochs
+        if args.save_last_every > 0 and (
+            (epoch + 1) % args.save_last_every == 0 or is_final_epoch
+        ):
+            torch.save(ckpt, last_path)
 
         if epoch_loss < best_loss:
             best_loss = epoch_loss
