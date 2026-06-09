@@ -5,6 +5,11 @@ SwinV2-Tiny (ImageNet) + UPerNet semantic segmentation for carbonate thin sectio
 Pairs images under ``<data_root>/img`` with masks under ``<data_root>/masks`` (same stem).
 Default: 16 classes (labels 0–15). Trains with AdamW; saves best checkpoint by validation mIoU.
 
+By default this runs 5-fold cross-validation (``--n_folds 5``): each fold trains a fresh
+model on 4/5 of the data and validates on the held-out 1/5, writing per-fold checkpoints
+under ``<output_dir>/fold_<i>/`` and an aggregate ``cv_summary.json`` (mean/std mIoU).
+Set ``--n_folds 1`` to fall back to a single train/val split governed by ``--val_frac``.
+
 Run locally::
 
     python swin_training_pipeline_221.py --data_root /path/to/carbonate_imgs_and_masks
@@ -15,6 +20,7 @@ Requires: torch, torchvision, transformers, tqdm, pillow, numpy.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 from pathlib import Path
@@ -119,7 +125,26 @@ def parse_args() -> argparse.Namespace:
         help="Focusing parameter for focal loss (only used when --loss_type=focal).",
     )
     p.add_argument("--crop", type=int, default=512, help="Train random crop and val center crop size.")
-    p.add_argument("--val_frac", type=float, default=0.2)
+    p.add_argument(
+        "--n_folds",
+        type=int,
+        default=5,
+        help="K for K-fold cross-validation (default 5). Set to 1 (or 0) to use a single "
+        "train/val split governed by --val_frac instead.",
+    )
+    p.add_argument(
+        "--fold",
+        type=int,
+        default=None,
+        help="If set, run only this fold index in [0, n_folds); otherwise run all folds. "
+        "Useful for parallelizing folds across separate sessions.",
+    )
+    p.add_argument(
+        "--val_frac",
+        type=float,
+        default=0.2,
+        help="Validation fraction for the single-split path (only used when --n_folds <= 1).",
+    )
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--output_dir", type=str, default=".", help="Directory for checkpoints and viz.")
@@ -176,7 +201,7 @@ def parse_args() -> argparse.Namespace:
         "--wandb_run_name",
         type=str,
         default=None,
-        help="Optional W&B run name (auto-generated if unset).",
+        help="Optional W&B run name (auto-generated if unset). Per-fold runs get a '_fold<i>' suffix.",
     )
     p.add_argument(
         "--wandb_entity",
@@ -197,6 +222,21 @@ def parse_args() -> argparse.Namespace:
 def default_data_root() -> Path:
     here = Path(__file__).resolve().parent
     return here.parent.parent / "data" / "carbonate_imgs_and_masks"
+
+
+def kfold_train_val_indices(n: int, n_folds: int, seed: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Return list of (train_idx, val_idx) for each fold; shuffled, stratification-free."""
+    if n_folds < 2:
+        raise ValueError("n_folds must be >= 2")
+    rng = np.random.RandomState(seed)
+    perm = rng.permutation(n)
+    parts = np.array_split(perm, n_folds)
+    splits: list[tuple[np.ndarray, np.ndarray]] = []
+    for f in range(n_folds):
+        val_idx = parts[f]
+        train_idx = np.concatenate([parts[j] for j in range(n_folds) if j != f])
+        splits.append((train_idx.astype(np.int64), val_idx.astype(np.int64)))
+    return splits
 
 
 def set_seed(seed: int) -> None:
@@ -607,320 +647,10 @@ def colorize_mask(mask_np: np.ndarray, palette: list | None = None) -> Image.Ima
     return Image.fromarray(rgb)
 
 
-def main() -> None:
-    args = parse_args()
-    set_seed(args.seed)
-
-    candidate_img_dir = Path(args.img_dir) if args.img_dir else None
-    candidate_mask_dir = Path(args.mask_dir) if args.mask_dir else None
-    use_explicit_dirs = bool(
-        candidate_img_dir
-        and candidate_mask_dir
-        and candidate_img_dir.is_dir()
-        and candidate_mask_dir.is_dir()
-    )
-    if use_explicit_dirs:
-        data_root = Path(args.data_root) if args.data_root else Path(".")
-        img_dir = candidate_img_dir
-        mask_dir = candidate_mask_dir
-        print(f"[config] Using explicit labeled dirs:\n  img={img_dir}\n  mask={mask_dir}")
-    elif args.data_root is None:
-        if candidate_img_dir or candidate_mask_dir:
-            print(
-                "[config] Explicit labeled dirs not found; falling back to --data_root/default layout.\n"
-                f"  checked img_dir={candidate_img_dir}\n"
-                f"  checked mask_dir={candidate_mask_dir}"
-            )
-        data_root = default_data_root()
-        if not (data_root / "img").is_dir():
-            raise SystemExit(
-                f"No --data_root given and default {data_root} is missing ``img/``. Pass --data_root explicitly."
-            )
-        print(f"[config] Using default data_root: {data_root}")
-    else:
-        data_root = Path(args.data_root)
-
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    crop = args.crop
-    train_transforms = Compose(
-        [
-            RandomHorizontalFlip(p=0.5),
-            RandomVerticalFlip(p=0.2),
-            RandomCrop((crop, crop)),
-        ]
-    )
-    val_transforms = Compose([CenterCrop((crop, crop))])
-
-    probe = CarbonateSegmentationDataset(
-        data_root,
-        img_dir=img_dir if use_explicit_dirs else None,
-        mask_dir=mask_dir if use_explicit_dirs else None,
-        transforms=None,
-        normalize=True,
-        strict=True,
-        ignore_scale_bar=args.ignore_scale_bar,
-    )
-    n = len(probe)
-
-    val_frac = args.val_frac
-    n_val = max(1, int(val_frac * n))
-    perm = torch.randperm(n, generator=torch.Generator().manual_seed(args.seed))
-    val_idx = perm[:n_val].tolist()
-    train_idx = perm[n_val:].tolist()
-
-    train_full = CarbonateSegmentationDataset(
-        data_root,
-        img_dir=img_dir if use_explicit_dirs else None,
-        mask_dir=mask_dir if use_explicit_dirs else None,
-        transforms=train_transforms,
-        normalize=True,
-        strict=False,
-        ignore_scale_bar=args.ignore_scale_bar,
-        print_pair_count=False,
-    )
-    val_full = CarbonateSegmentationDataset(
-        data_root,
-        img_dir=img_dir if use_explicit_dirs else None,
-        mask_dir=mask_dir if use_explicit_dirs else None,
-        transforms=val_transforms,
-        normalize=True,
-        strict=False,
-        ignore_scale_bar=args.ignore_scale_bar,
-        print_pair_count=False,
-    )
-
-    train_ds = Subset(train_full, train_idx)
-    val_ds = Subset(val_full, val_idx)
-
-    on_gpu = torch.cuda.is_available()
-    device = torch.device("cuda" if on_gpu else "cpu")
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=on_gpu,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=on_gpu,
-    )
-
-    print(f"Train samples: {len(train_ds)} | Val samples: {len(val_ds)}")
-
-    if args.no_train:
-        print("[config] --no_train set; exiting after dataloader smoke test.")
-        return
-
-    class_weights: torch.Tensor | None = None
-    if args.class_weights:
-        w = np.load(args.class_weights).astype(np.float32)
-        if w.shape != (NUM_CLASSES,):
-            raise ValueError(f"class_weights .npy must have shape ({NUM_CLASSES},), got {w.shape}")
-        class_weights = torch.tensor(w, device=device)
-    elif args.auto_class_weights:
-        class_weights = estimate_class_weights_from_dataset(train_ds, NUM_CLASSES, IGNORE_INDEX, device)
-        print("[train] Using auto-estimated class weights:", class_weights.detach().cpu().numpy().round(3).tolist())
-
-    model = get_model_semantic_segmentation(NUM_CLASSES, IGNORE_INDEX, BACKBONE_ID)
-    if args.backbone_checkpoint:
-        load_ssl_backbone_checkpoint(model, args.backbone_checkpoint)
-    model = model.to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    # Build the main scheduler (post-warmup), then optionally chain a linear-warmup
-    # SequentialLR in front of it.
-    main_sched: torch.optim.lr_scheduler._LRScheduler | None = None
-    main_epochs = max(1, args.epochs - max(0, args.warmup_epochs))
-    if args.scheduler == "cosine":
-        main_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=main_epochs)
-    elif args.scheduler == "step":
-        main_sched = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=max(1, args.step_size), gamma=args.gamma
-        )
-
-    if args.warmup_epochs > 0:
-        warmup_sched = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1e-3, end_factor=1.0, total_iters=args.warmup_epochs
-        )
-        if main_sched is None:
-            scheduler = warmup_sched
-        else:
-            scheduler = torch.optim.lr_scheduler.SequentialLR(
-                optimizer,
-                schedulers=[warmup_sched, main_sched],
-                milestones=[args.warmup_epochs],
-            )
-    else:
-        scheduler = main_sched
-
-    # ------------------------------------------------------------------
-    # Weights & Biases setup (logged once, then per-epoch metrics below).
-    # ------------------------------------------------------------------
-    wandb_run = None
-    if args.wandb_project and args.wandb_mode != "disabled":
-        if not _WANDB_AVAILABLE:
-            print("[wandb] wandb not installed; skipping logging. `pip install wandb` to enable.")
-        else:
-            import wandb as _wandb  # local re-import for clarity
-            wandb_run = _wandb.init(
-                project=args.wandb_project,
-                entity=args.wandb_entity,
-                name=args.wandb_run_name,
-                mode=args.wandb_mode,
-                config={
-                    "stage": "finetune",
-                    "backbone_id": BACKBONE_ID,
-                    "num_classes": NUM_CLASSES,
-                    "epochs": args.epochs,
-                    "batch_size": args.batch_size,
-                    "lr": args.lr,
-                    "weight_decay": args.weight_decay,
-                    "warmup_epochs": args.warmup_epochs,
-                    "scheduler": args.scheduler,
-                    "loss_type": args.loss_type,
-                    "focal_gamma": args.focal_gamma,
-                    "auto_class_weights": args.auto_class_weights,
-                    "class_weights_path": args.class_weights,
-                    "ignore_scale_bar": args.ignore_scale_bar,
-                    "crop": args.crop,
-                    "val_frac": args.val_frac,
-                    "seed": args.seed,
-                    "ssl_backbone_checkpoint": args.backbone_checkpoint,
-                },
-            )
-            print(f"[wandb] logging to project={args.wandb_project} run={wandb_run.name}")
-
-    best_miou = -1.0
-    ckpt_path = out_dir / "best_upernet_swinv2.pth"
-    per_class_log_path = out_dir / "val_per_class_iou.csv"
-    with per_class_log_path.open("w", encoding="utf-8") as f:
-        f.write("epoch," + ",".join(f"class_{i}" for i in range(NUM_CLASSES)) + "\n")
-
-    # In-memory history for end-of-run W&B composite chart + table.
-    epoch_history: list[int] = []
-    per_class_history: list[list[float]] = [[] for _ in range(NUM_CLASSES)]
-
-    for epoch in range(1, args.epochs + 1):
-        tr = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            device,
-            epoch,
-            NUM_CLASSES,
-            IGNORE_INDEX,
-            class_weights,
-            scheduler,
-            loss_type=args.loss_type,
-            focal_gamma=args.focal_gamma,
-        )
-        va_loss, va_acc, va_miou, per_iou = evaluate(
-            model,
-            val_loader,
-            device,
-            NUM_CLASSES,
-            IGNORE_INDEX,
-            class_weights,
-            loss_type=args.loss_type,
-            focal_gamma=args.focal_gamma,
-        )
-        print(
-            f"Epoch {epoch:02d} | train {tr:.4f} | val {va_loss:.4f} | acc {va_acc:.3f} | mIoU {va_miou:.3f}"
-        )
-        print_per_class_iou(per_iou, epoch)
-        with per_class_log_path.open("a", encoding="utf-8") as f:
-            vals = ",".join(f"{float(v):.6f}" if torch.isfinite(v) else "nan" for v in per_iou.detach().cpu())
-            f.write(f"{epoch},{vals}\n")
-
-        # Track per-class IoU history (used for the end-of-run composite chart + table).
-        epoch_history.append(epoch)
-        per_iou_cpu = per_iou.detach().cpu()
-        for i in range(NUM_CLASSES):
-            v = per_iou_cpu[i].item()
-            per_class_history[i].append(float(v) if torch.isfinite(per_iou_cpu[i]).item() else float("nan"))
-
-        # ------- Weights & Biases per-epoch metrics -------
-        if wandb_run is not None:
-            current_lr = optimizer.param_groups[0]["lr"]
-            log_payload = {
-                "epoch": epoch,
-                "lr": current_lr,
-                "train/loss": tr,
-                "val/loss": va_loss,
-                "val/pixel_acc": va_acc,
-                "val/mIoU": va_miou,
-            }
-            for i, name in enumerate(CLASS_NAMES[: per_iou.numel()]):
-                v = per_iou[i].item()
-                if torch.isfinite(per_iou[i]).item():
-                    log_payload[f"val_iou/{i:02d}_{name}"] = v
-            wandb_run.log(log_payload, step=epoch)
-
-        if va_miou > best_miou:
-            best_miou = va_miou
-            torch.save(
-                {
-                    "model_state": model.state_dict(),
-                    "num_classes": NUM_CLASSES,
-                    "ignore_index": IGNORE_INDEX,
-                    "backbone_id": BACKBONE_ID,
-                    "per_class_val_iou": per_iou.cpu(),
-                },
-                ckpt_path,
-            )
-            print(f"  saved {ckpt_path}")
-            if wandb_run is not None:
-                wandb_run.summary["best_val_mIoU"] = best_miou
-                wandb_run.summary["best_epoch"] = epoch
-
-    # ------- End-of-run W&B summary artifacts: composite line chart + table -------
-    if wandb_run is not None and epoch_history:
-        import wandb as _wandb
-
-        # Composite chart: all classes on one panel, one line per class.
-        # NaN values are replaced with None so missing classes are dropped from the line.
-        ys_per_class = [
-            [None if (isinstance(v, float) and (v != v)) else v for v in series]
-            for series in per_class_history
-        ]
-        try:
-            line_chart = _wandb.plot.line_series(
-                xs=epoch_history,
-                ys=ys_per_class,
-                keys=list(CLASS_NAMES[:NUM_CLASSES]),
-                title="Per-class validation IoU across epochs",
-                xname="epoch",
-            )
-            wandb_run.log({"val_iou/per_class_lines": line_chart})
-        except Exception as exc:  # noqa: BLE001 — best-effort, don't kill the run.
-            print(f"[wandb] line_series chart skipped: {exc}")
-
-        # Sortable table: rows = epochs, columns = epoch + each class IoU.
-        try:
-            tbl = _wandb.Table(columns=["epoch"] + list(CLASS_NAMES[:NUM_CLASSES]))
-            for row_idx, ep in enumerate(epoch_history):
-                row = [ep] + [per_class_history[c][row_idx] for c in range(NUM_CLASSES)]
-                tbl.add_data(*row)
-            wandb_run.log({"val_iou/per_class_table": tbl})
-        except Exception as exc:  # noqa: BLE001
-            print(f"[wandb] per-class table skipped: {exc}")
-
-        wandb_run.finish()
-
-    if args.no_viz:
-        return
-
+def render_predictions(model, val_ds, device, crop: int, args, viz_dir: Path) -> None:
+    """Save prediction masks + 4-panel figures for the first ``--viz_samples`` val items."""
     model.eval()
     n_viz = max(1, min(args.viz_samples, len(val_ds)))
-    viz_dir = out_dir / "prediction_viz"
     viz_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -1000,6 +730,445 @@ def main() -> None:
                 pred_np = pred.numpy().astype(np.uint8)
                 Image.fromarray(np.array(colorize_mask(pred_np))).save(viz_dir / f"prediction_{i:02d}.png")
         print(f"[viz] matplotlib not installed; saved {n_viz} predicted masks under {viz_dir}")
+
+
+def run_single_fold(
+    fold: int,
+    n_folds: int,
+    train_idx: list[int],
+    val_idx: list[int],
+    data_root: Path,
+    img_dir: Path | None,
+    mask_dir: Path | None,
+    use_explicit_dirs: bool,
+    args: argparse.Namespace,
+    device: torch.device,
+    on_gpu: bool,
+) -> dict:
+    """Train + validate one fold (or the single split when n_folds <= 1).
+
+    Returns a dict of best-checkpoint metrics for the cross-validation summary.
+    """
+    # When cross-validating, isolate each fold's artifacts under fold_<i>/.
+    # For the single-split path (n_folds <= 1) keep the historical flat layout.
+    fold_dir = Path(args.output_dir) / f"fold_{fold}" if n_folds >= 2 else Path(args.output_dir)
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"Fold {fold + 1}/{n_folds} | " if n_folds >= 2 else ""
+
+    crop = args.crop
+    train_transforms = Compose(
+        [
+            RandomHorizontalFlip(p=0.5),
+            RandomVerticalFlip(p=0.2),
+            RandomCrop((crop, crop)),
+        ]
+    )
+    val_transforms = Compose([CenterCrop((crop, crop))])
+
+    train_full = CarbonateSegmentationDataset(
+        data_root,
+        img_dir=img_dir if use_explicit_dirs else None,
+        mask_dir=mask_dir if use_explicit_dirs else None,
+        transforms=train_transforms,
+        normalize=True,
+        strict=False,
+        ignore_scale_bar=args.ignore_scale_bar,
+        print_pair_count=False,
+    )
+    val_full = CarbonateSegmentationDataset(
+        data_root,
+        img_dir=img_dir if use_explicit_dirs else None,
+        mask_dir=mask_dir if use_explicit_dirs else None,
+        transforms=val_transforms,
+        normalize=True,
+        strict=False,
+        ignore_scale_bar=args.ignore_scale_bar,
+        print_pair_count=False,
+    )
+
+    train_ds = Subset(train_full, train_idx)
+    val_ds = Subset(val_full, val_idx)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=on_gpu,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=on_gpu,
+    )
+
+    print(f"[train] {tag}Train samples: {len(train_ds)} | Val samples: {len(val_ds)}")
+
+    if args.no_train:
+        print("[config] --no_train set; exiting after dataloader smoke test.")
+        return {"fold": fold, "status": "no_train"}
+
+    class_weights: torch.Tensor | None = None
+    if args.class_weights:
+        w = np.load(args.class_weights).astype(np.float32)
+        if w.shape != (NUM_CLASSES,):
+            raise ValueError(f"class_weights .npy must have shape ({NUM_CLASSES},), got {w.shape}")
+        class_weights = torch.tensor(w, device=device)
+    elif args.auto_class_weights:
+        class_weights = estimate_class_weights_from_dataset(train_ds, NUM_CLASSES, IGNORE_INDEX, device)
+        print("[train] Using auto-estimated class weights:", class_weights.detach().cpu().numpy().round(3).tolist())
+
+    model = get_model_semantic_segmentation(NUM_CLASSES, IGNORE_INDEX, BACKBONE_ID)
+    if args.backbone_checkpoint:
+        load_ssl_backbone_checkpoint(model, args.backbone_checkpoint)
+    model = model.to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # Build the main scheduler (post-warmup), then optionally chain a linear-warmup
+    # SequentialLR in front of it.
+    main_sched: torch.optim.lr_scheduler._LRScheduler | None = None
+    main_epochs = max(1, args.epochs - max(0, args.warmup_epochs))
+    if args.scheduler == "cosine":
+        main_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=main_epochs)
+    elif args.scheduler == "step":
+        main_sched = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=max(1, args.step_size), gamma=args.gamma
+        )
+
+    if args.warmup_epochs > 0:
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-3, end_factor=1.0, total_iters=args.warmup_epochs
+        )
+        if main_sched is None:
+            scheduler = warmup_sched
+        else:
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_sched, main_sched],
+                milestones=[args.warmup_epochs],
+            )
+    else:
+        scheduler = main_sched
+
+    # ------------------------------------------------------------------
+    # Weights & Biases setup (logged once, then per-epoch metrics below).
+    # ------------------------------------------------------------------
+    wandb_run = None
+    if args.wandb_project and args.wandb_mode != "disabled":
+        if not _WANDB_AVAILABLE:
+            print("[wandb] wandb not installed; skipping logging. `pip install wandb` to enable.")
+        else:
+            import wandb as _wandb  # local re-import for clarity
+
+            run_name = args.wandb_run_name
+            if n_folds >= 2:
+                run_name = f"{run_name}_fold{fold}" if run_name else f"fold{fold}"
+            wandb_run = _wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=run_name,
+                mode=args.wandb_mode,
+                group=args.wandb_run_name or None,
+                reinit=True,
+                config={
+                    "stage": "finetune",
+                    "backbone_id": BACKBONE_ID,
+                    "num_classes": NUM_CLASSES,
+                    "epochs": args.epochs,
+                    "batch_size": args.batch_size,
+                    "lr": args.lr,
+                    "weight_decay": args.weight_decay,
+                    "warmup_epochs": args.warmup_epochs,
+                    "scheduler": args.scheduler,
+                    "loss_type": args.loss_type,
+                    "focal_gamma": args.focal_gamma,
+                    "auto_class_weights": args.auto_class_weights,
+                    "class_weights_path": args.class_weights,
+                    "ignore_scale_bar": args.ignore_scale_bar,
+                    "crop": args.crop,
+                    "n_folds": n_folds,
+                    "fold": fold,
+                    "val_frac": args.val_frac,
+                    "seed": args.seed,
+                    "ssl_backbone_checkpoint": args.backbone_checkpoint,
+                },
+            )
+            print(f"[wandb] logging to project={args.wandb_project} run={wandb_run.name}")
+
+    best_miou = -1.0
+    best_acc = 0.0
+    best_epoch = -1
+    best_per_iou: torch.Tensor | None = None
+    ckpt_path = fold_dir / "best_upernet_swinv2.pth"
+    per_class_log_path = fold_dir / "val_per_class_iou.csv"
+    with per_class_log_path.open("w", encoding="utf-8") as f:
+        f.write("epoch," + ",".join(f"class_{i}" for i in range(NUM_CLASSES)) + "\n")
+
+    # In-memory history for end-of-run W&B composite chart + table.
+    epoch_history: list[int] = []
+    per_class_history: list[list[float]] = [[] for _ in range(NUM_CLASSES)]
+
+    for epoch in range(1, args.epochs + 1):
+        tr = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            epoch,
+            NUM_CLASSES,
+            IGNORE_INDEX,
+            class_weights,
+            scheduler,
+            loss_type=args.loss_type,
+            focal_gamma=args.focal_gamma,
+        )
+        va_loss, va_acc, va_miou, per_iou = evaluate(
+            model,
+            val_loader,
+            device,
+            NUM_CLASSES,
+            IGNORE_INDEX,
+            class_weights,
+            loss_type=args.loss_type,
+            focal_gamma=args.focal_gamma,
+        )
+        print(
+            f"{tag}Epoch {epoch:02d} | train {tr:.4f} | val {va_loss:.4f} | acc {va_acc:.3f} | mIoU {va_miou:.3f}"
+        )
+        print_per_class_iou(per_iou, epoch)
+        with per_class_log_path.open("a", encoding="utf-8") as f:
+            vals = ",".join(f"{float(v):.6f}" if torch.isfinite(v) else "nan" for v in per_iou.detach().cpu())
+            f.write(f"{epoch},{vals}\n")
+
+        # Track per-class IoU history (used for the end-of-run composite chart + table).
+        epoch_history.append(epoch)
+        per_iou_cpu = per_iou.detach().cpu()
+        for i in range(NUM_CLASSES):
+            v = per_iou_cpu[i].item()
+            per_class_history[i].append(float(v) if torch.isfinite(per_iou_cpu[i]).item() else float("nan"))
+
+        # ------- Weights & Biases per-epoch metrics -------
+        if wandb_run is not None:
+            current_lr = optimizer.param_groups[0]["lr"]
+            log_payload = {
+                "epoch": epoch,
+                "lr": current_lr,
+                "train/loss": tr,
+                "val/loss": va_loss,
+                "val/pixel_acc": va_acc,
+                "val/mIoU": va_miou,
+            }
+            for i, name in enumerate(CLASS_NAMES[: per_iou.numel()]):
+                v = per_iou[i].item()
+                if torch.isfinite(per_iou[i]).item():
+                    log_payload[f"val_iou/{i:02d}_{name}"] = v
+            wandb_run.log(log_payload, step=epoch)
+
+        if va_miou > best_miou:
+            best_miou = va_miou
+            best_acc = va_acc
+            best_epoch = epoch
+            best_per_iou = per_iou.detach().cpu()
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "num_classes": NUM_CLASSES,
+                    "ignore_index": IGNORE_INDEX,
+                    "backbone_id": BACKBONE_ID,
+                    "fold": fold,
+                    "n_folds": n_folds,
+                    "per_class_val_iou": per_iou.cpu(),
+                },
+                ckpt_path,
+            )
+            print(f"  saved {ckpt_path}")
+            if wandb_run is not None:
+                wandb_run.summary["best_val_mIoU"] = best_miou
+                wandb_run.summary["best_epoch"] = epoch
+
+    # ------- End-of-run W&B summary artifacts: composite line chart + table -------
+    if wandb_run is not None and epoch_history:
+        import wandb as _wandb
+
+        # Composite chart: all classes on one panel, one line per class.
+        # NaN values are replaced with None so missing classes are dropped from the line.
+        ys_per_class = [
+            [None if (isinstance(v, float) and (v != v)) else v for v in series]
+            for series in per_class_history
+        ]
+        try:
+            line_chart = _wandb.plot.line_series(
+                xs=epoch_history,
+                ys=ys_per_class,
+                keys=list(CLASS_NAMES[:NUM_CLASSES]),
+                title="Per-class validation IoU across epochs",
+                xname="epoch",
+            )
+            wandb_run.log({"val_iou/per_class_lines": line_chart})
+        except Exception as exc:  # noqa: BLE001 — best-effort, don't kill the run.
+            print(f"[wandb] line_series chart skipped: {exc}")
+
+        # Sortable table: rows = epochs, columns = epoch + each class IoU.
+        try:
+            tbl = _wandb.Table(columns=["epoch"] + list(CLASS_NAMES[:NUM_CLASSES]))
+            for row_idx, ep in enumerate(epoch_history):
+                row = [ep] + [per_class_history[c][row_idx] for c in range(NUM_CLASSES)]
+                tbl.add_data(*row)
+            wandb_run.log({"val_iou/per_class_table": tbl})
+        except Exception as exc:  # noqa: BLE001
+            print(f"[wandb] per-class table skipped: {exc}")
+
+        wandb_run.finish()
+
+    if not args.no_viz:
+        render_predictions(model, val_ds, device, crop, args, fold_dir / "prediction_viz")
+
+    per_iou_list = (
+        [None if not torch.isfinite(v).item() else float(v) for v in best_per_iou]
+        if best_per_iou is not None
+        else None
+    )
+    return {
+        "fold": fold,
+        "best_epoch": best_epoch,
+        "miou": float(best_miou),
+        "pixel_acc": float(best_acc),
+        "per_class_val_iou": per_iou_list,
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    set_seed(args.seed)
+
+    candidate_img_dir = Path(args.img_dir) if args.img_dir else None
+    candidate_mask_dir = Path(args.mask_dir) if args.mask_dir else None
+    use_explicit_dirs = bool(
+        candidate_img_dir
+        and candidate_mask_dir
+        and candidate_img_dir.is_dir()
+        and candidate_mask_dir.is_dir()
+    )
+    if use_explicit_dirs:
+        data_root = Path(args.data_root) if args.data_root else Path(".")
+        img_dir = candidate_img_dir
+        mask_dir = candidate_mask_dir
+        print(f"[config] Using explicit labeled dirs:\n  img={img_dir}\n  mask={mask_dir}")
+    elif args.data_root is None:
+        if candidate_img_dir or candidate_mask_dir:
+            print(
+                "[config] Explicit labeled dirs not found; falling back to --data_root/default layout.\n"
+                f"  checked img_dir={candidate_img_dir}\n"
+                f"  checked mask_dir={candidate_mask_dir}"
+            )
+        data_root = default_data_root()
+        if not (data_root / "img").is_dir():
+            raise SystemExit(
+                f"No --data_root given and default {data_root} is missing ``img/``. Pass --data_root explicitly."
+            )
+        print(f"[config] Using default data_root: {data_root}")
+        img_dir = None
+        mask_dir = None
+    else:
+        data_root = Path(args.data_root)
+        img_dir = None
+        mask_dir = None
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    probe = CarbonateSegmentationDataset(
+        data_root,
+        img_dir=img_dir if use_explicit_dirs else None,
+        mask_dir=mask_dir if use_explicit_dirs else None,
+        transforms=None,
+        normalize=True,
+        strict=True,
+        ignore_scale_bar=args.ignore_scale_bar,
+    )
+    n = len(probe)
+
+    on_gpu = torch.cuda.is_available()
+    device = torch.device("cuda" if on_gpu else "cpu")
+
+    use_kfold = args.n_folds is not None and args.n_folds >= 2
+
+    # ------------------------------------------------------------------
+    # Single train/val split (legacy path: --n_folds 1).
+    # ------------------------------------------------------------------
+    if not use_kfold:
+        n_val = max(1, int(args.val_frac * n))
+        perm = torch.randperm(n, generator=torch.Generator().manual_seed(args.seed))
+        val_idx = perm[:n_val].tolist()
+        train_idx = perm[n_val:].tolist()
+        print(f"[config] Single split | val_frac={args.val_frac} | train={len(train_idx)} val={len(val_idx)}")
+        run_single_fold(
+            0, 1, train_idx, val_idx, data_root, img_dir, mask_dir, use_explicit_dirs, args, device, on_gpu
+        )
+        return
+
+    # ------------------------------------------------------------------
+    # K-fold cross-validation (default: --n_folds 5).
+    # ------------------------------------------------------------------
+    if n < args.n_folds:
+        raise SystemExit(f"Need at least {args.n_folds} samples for {args.n_folds}-fold CV; found {n}.")
+
+    splits = kfold_train_val_indices(n, args.n_folds, args.seed)
+
+    if args.fold is not None:
+        if args.fold < 0 or args.fold >= args.n_folds:
+            raise SystemExit(f"--fold must be in [0, {args.n_folds}), got {args.fold}")
+        folds_to_run = [args.fold]
+    else:
+        folds_to_run = list(range(args.n_folds))
+
+    print(
+        f"[config] Multiclass UPerNet+SwinV2 | {args.n_folds}-fold cross-validation | "
+        f"seed={args.seed} | folds_to_run={folds_to_run} | n={n}"
+    )
+
+    all_best: list[dict] = []
+    for fold in folds_to_run:
+        tr, va = splits[fold]
+        result = run_single_fold(
+            fold,
+            args.n_folds,
+            tr.tolist(),
+            va.tolist(),
+            data_root,
+            img_dir,
+            mask_dir,
+            use_explicit_dirs,
+            args,
+            device,
+            on_gpu,
+        )
+        if result.get("status") != "no_train":
+            all_best.append(result)
+
+    if args.no_train:
+        return
+
+    summary_path = out_dir / "cv_summary.json"
+    miou_vals = [r["miou"] for r in all_best]
+    acc_vals = [r["pixel_acc"] for r in all_best]
+    summary = {
+        "n_folds": args.n_folds,
+        "folds_completed": folds_to_run,
+        "per_fold_best": all_best,
+        "mean_best_miou": float(np.mean(miou_vals)) if miou_vals else None,
+        "std_best_miou": float(np.std(miou_vals)) if miou_vals else None,
+        "mean_best_pixel_acc": float(np.mean(acc_vals)) if acc_vals else None,
+        "std_best_pixel_acc": float(np.std(acc_vals)) if acc_vals else None,
+    }
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    print("\n=== Cross-validation summary ===")
+    print(json.dumps(summary, indent=2))
+    print(f"\nWrote {summary_path}")
 
 
 if __name__ == "__main__":
