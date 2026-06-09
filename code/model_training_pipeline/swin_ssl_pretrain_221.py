@@ -31,6 +31,12 @@ from tqdm.auto import tqdm
 from transformers import Swinv2Model
 import matplotlib.pyplot as plt
 
+try:
+    import wandb  # noqa: F401
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 BACKBONE_ID = "microsoft/swinv2-tiny-patch4-window8-256"
@@ -63,17 +69,25 @@ def parse_args() -> argparse.Namespace:
         help="Google Drive root containing the three unlabeled subfolders.",
     )
     p.add_argument("--output_dir", type=str, default=".", help="Directory for SSL checkpoints.")
-    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--crop", type=int, default=512, help="Random crop size for SSL training.")
     p.add_argument("--mask_patch", type=int, default=16, help="Masking block size in pixels.")
-    p.add_argument("--mask_ratio", type=float, default=0.55, help="Fraction of mask blocks to hide.")
+    p.add_argument("--mask_ratio", type=float, default=0.70, help="Fraction of mask blocks to hide.")
     p.add_argument("--lr", type=float, default=1.5e-4)
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--warmup_epochs", type=int, default=10)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--checkpoint_every", type=int, default=5)
+    p.add_argument(
+        "--save_last_every",
+        type=int,
+        default=1,
+        help="Save ssl_swinv2_last.pth every N epochs (default 1 = every epoch). "
+        "Increase to 5+ to cut Drive-write stalls when Drive FUSE is slow; you only "
+        "lose up to N-1 epochs of progress on a runtime crash before the next save.",
+    )
     p.add_argument("--resume", type=str, default=None, help="Optional checkpoint path to resume SSL training.")
     p.add_argument("--amp", action="store_true", help="Enable AMP mixed precision.")
     p.add_argument("--max_steps_per_epoch", type=int, default=0, help="0 means full epoch.")
@@ -89,6 +103,32 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="Number of batch items shown in each reconstruction preview.",
+    )
+    # Weights & Biases logging.
+    p.add_argument(
+        "--wandb_project",
+        type=str,
+        default=None,
+        help="W&B project name. If unset, W&B logging is disabled.",
+    )
+    p.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="Optional W&B run name (auto-generated if unset).",
+    )
+    p.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="Optional W&B entity (team or user).",
+    )
+    p.add_argument(
+        "--wandb_mode",
+        type=str,
+        default="online",
+        choices=["online", "offline", "disabled"],
+        help="W&B mode (online uploads live; offline writes locally; disabled = no logging).",
     )
     return p.parse_args()
 
@@ -325,17 +365,79 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
     scaler = GradScaler(device="cuda", enabled=(args.amp and on_gpu))
 
+    # ------------------------------------------------------------------
+    # Weights & Biases setup.
+    # ------------------------------------------------------------------
+    wandb_run = None
+    if args.wandb_project and args.wandb_mode != "disabled":
+        if not _WANDB_AVAILABLE:
+            print("[wandb] wandb not installed; skipping logging. `pip install wandb` to enable.")
+        else:
+            import wandb as _wandb
+            wandb_run = _wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name,
+                mode=args.wandb_mode,
+                config={
+                    "stage": "ssl_pretrain",
+                    "backbone_id": BACKBONE_ID,
+                    "epochs": args.epochs,
+                    "batch_size": args.batch_size,
+                    "lr": args.lr,
+                    "weight_decay": args.weight_decay,
+                    "warmup_epochs": args.warmup_epochs,
+                    "crop": args.crop,
+                    "mask_patch": args.mask_patch,
+                    "mask_ratio": args.mask_ratio,
+                    "amp": args.amp,
+                    "seed": args.seed,
+                    "num_unlabeled_images": len(ds),
+                },
+            )
+            print(f"[wandb] logging to project={args.wandb_project} run={wandb_run.name}")
+
     start_epoch = 0
     best_loss = float("inf")
     if args.resume:
-        ckpt = torch.load(args.resume, map_location="cpu")
-        model.load_state_dict(ckpt["model_state"])
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-        if "scaler_state" in ckpt and scaler.is_enabled():
-            scaler.load_state_dict(ckpt["scaler_state"])
-        start_epoch = int(ckpt.get("epoch", -1)) + 1
-        best_loss = float(ckpt.get("best_loss", best_loss))
-        print(f"[ssl] Resumed from {args.resume} at epoch {start_epoch}")
+        # weights_only=False: our checkpoints contain numpy scalars (e.g. best_loss);
+        # PyTorch 2.6+ refuses to unpickle those under the new weights_only=True default.
+        ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+        saved_epoch = int(ckpt.get("epoch", -1))  # zero-indexed
+        next_epoch = saved_epoch + 1
+        if next_epoch >= args.epochs:
+            # Previous run already completed the requested target. Archive the
+            # old artifacts under a timestamped subfolder so they aren't
+            # overwritten, then start a fresh run from epoch 0.
+            import datetime
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_dir = out_dir / f"archive_complete_e{next_epoch}_{stamp}"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            archived = 0
+            for pattern in (
+                "ssl_swinv2_last.pth",
+                "ssl_swinv2_best.pth",
+                "ssl_swinv2_epoch_*.pth",
+            ):
+                for p in out_dir.glob(pattern):
+                    p.rename(archive_dir / p.name)
+                    archived += 1
+            recon_dir = out_dir / "recon_previews"
+            if recon_dir.is_dir() and any(recon_dir.iterdir()):
+                recon_dir.rename(archive_dir / "recon_previews")
+                archived += 1
+            print(
+                f"[ssl] Previous run already completed {next_epoch} >= --epochs {args.epochs} epochs. "
+                f"Archived {archived} artifact(s) to {archive_dir.name}. Starting fresh from epoch 0."
+            )
+        else:
+            model.load_state_dict(ckpt["model_state"])
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+            if "scaler_state" in ckpt and scaler.is_enabled():
+                scaler.load_state_dict(ckpt["scaler_state"])
+            start_epoch = next_epoch
+            best_loss = float(ckpt.get("best_loss", best_loss))
+            print(f"[ssl] Resumed from {args.resume} at epoch {start_epoch}")
 
     for epoch in range(start_epoch, args.epochs):
         lr = cosine_lr(args.lr, epoch, args.epochs, args.warmup_epochs)
@@ -386,6 +488,16 @@ def main() -> None:
         epoch_loss = running / max(1, steps)
         print(f"[ssl] epoch {epoch + 1:03d} | loss {epoch_loss:.5f} | lr {lr:.2e}")
 
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "epoch": epoch + 1,
+                    "lr": lr,
+                    "ssl/train_loss": epoch_loss,
+                },
+                step=epoch + 1,
+            )
+
         if args.save_recon_every > 0 and ((epoch + 1) % args.save_recon_every == 0) and preview_cache is not None:
             p_imgs, p_masked, p_pred, p_mask = preview_cache
             save_reconstruction_preview(
@@ -414,8 +526,14 @@ def main() -> None:
         if scaler.is_enabled():
             ckpt["scaler_state"] = scaler.state_dict()
 
+        # Save the resume-checkpoint only every --save_last_every epochs (default 1).
+        # On the final epoch, always save so the run ends in a resumable state.
         last_path = out_dir / "ssl_swinv2_last.pth"
-        torch.save(ckpt, last_path)
+        is_final_epoch = (epoch + 1) == args.epochs
+        if args.save_last_every > 0 and (
+            (epoch + 1) % args.save_last_every == 0 or is_final_epoch
+        ):
+            torch.save(ckpt, last_path)
 
         if epoch_loss < best_loss:
             best_loss = epoch_loss
@@ -424,6 +542,10 @@ def main() -> None:
 
         if (epoch + 1) % args.checkpoint_every == 0:
             torch.save(ckpt, out_dir / f"ssl_swinv2_epoch_{epoch + 1:03d}.pth")
+
+    if wandb_run is not None:
+        wandb_run.summary["best_loss"] = best_loss
+        wandb_run.finish()
 
     print("[ssl] Done.")
 

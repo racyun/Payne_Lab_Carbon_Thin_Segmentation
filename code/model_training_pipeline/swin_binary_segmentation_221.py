@@ -54,10 +54,10 @@ def _json_sanitize(obj):
     return obj
 
 DEFAULT_GDRIVE_LABELED_IMG_DIR = (
-    "/content/drive/My Drive/Petrographic images_ML work/labelled images_PS/labelled images_PS/my_dataset/img"
+    "/content/drive/My Drive/Petrographic images_ML work/labelled images_PS/labelledDataset_02032026/my_dataset/img"
 )
 DEFAULT_GDRIVE_LABELED_MASK_DIR = (
-    "/content/drive/My Drive/Petrographic images_ML work/labelled images_PS/labelled images_PS/my_dataset/masks_machine"
+    "/content/drive/My Drive/Petrographic images_ML work/labelled images_PS/labelledDataset_02032026/my_dataset/masks_machine"
 )
 
 
@@ -428,7 +428,10 @@ def run_single_fold(
     metrics_csv = fold_dir / "val_metrics.csv"
 
     with metrics_csv.open("w", encoding="utf-8") as f:
-        f.write("epoch,train_loss,val_loss,pixel_acc,miou,iou_bg,iou_grain\n")
+        f.write(
+            "epoch,train_loss,val_loss,pixel_acc,miou,iou_bg,iou_grain,"
+            "gt_bg_pct,gt_grain_pct,pred_bg_pct,pred_grain_pct\n"
+        )
 
     print(
         "[train] Tqdm will sit at 0% until the first batch completes (read masks + UPerNet forward). "
@@ -467,8 +470,15 @@ def run_single_fold(
 
         i0 = float(per_iou[0].item()) if torch.isfinite(per_iou[0]).item() else float("nan")
         i1 = float(per_iou[1].item()) if torch.isfinite(per_iou[1]).item() else float("nan")
+        gt_bg = float(gt_frac[0].item())
+        gt_grain = float(gt_frac[1].item())
+        pred_bg = float(pred_frac[0].item())
+        pred_grain = float(pred_frac[1].item())
         with metrics_csv.open("a", encoding="utf-8") as f:
-            f.write(f"{epoch},{tr:.6f},{va_loss:.6f},{va_acc:.6f},{va_miou:.6f},{i0:.6f},{i1:.6f}\n")
+            f.write(
+                f"{epoch},{tr:.6f},{va_loss:.6f},{va_acc:.6f},{va_miou:.6f},{i0:.6f},{i1:.6f},"
+                f"{100.0*gt_bg:.4f},{100.0*gt_grain:.4f},{100.0*pred_bg:.4f},{100.0*pred_grain:.4f}\n"
+            )
 
         if va_miou > best_miou:
             best_miou = va_miou
