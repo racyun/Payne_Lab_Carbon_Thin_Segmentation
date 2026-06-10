@@ -3,7 +3,9 @@
 SwinV2-Tiny (ImageNet) + UPerNet semantic segmentation for carbonate thin sections.
 
 Pairs images under ``<data_root>/img`` with masks under ``<data_root>/masks`` (same stem).
-Default: 16 classes (labels 0–15). Trains with AdamW; saves best checkpoint by validation mIoU.
+Default: 18 classes (labels 0–17). Trains with AdamW; saves best checkpoint by validation mIoU.
+Classes 11 (scale bar) and 17 (watermark) are non-biological artifacts; pass
+``--ignore_artifacts`` to remap them to ignore_index so they are excluded from the loss.
 
 By default this runs 5-fold cross-validation (``--n_folds 5``): each fold trains a fresh
 model on 4/5 of the data and validates on the held-out 1/5, writing per-fold checkpoints
@@ -49,15 +51,19 @@ except ImportError:
     _WANDB_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-# Constants (carbonate labeling: 0–15 => 16 logits)
+# Constants (carbonate labeling: 0–17 => 18 logits)
 # ---------------------------------------------------------------------------
 
-NUM_CLASSES = 16
+NUM_CLASSES = 18
 IGNORE_INDEX = 255
 SCALE_BAR_CLASS_ID = 11
+WATERMARK_CLASS_ID = 17
+# Non-biological annotation artifacts. With --ignore_artifacts these are remapped to
+# ignore_index so they neither contribute to the loss nor appear in per-class metrics.
+ARTIFACT_CLASS_IDS = (SCALE_BAR_CLASS_ID, WATERMARK_CLASS_ID)
 BACKBONE_ID = "microsoft/swinv2-tiny-patch4-window8-256"
 
-# Label ids 0–15 (must align with NUM_CLASSES).
+# Label ids 0–17 (must align with NUM_CLASSES).
 CLASS_NAMES = (
     "background",
     "bivalves",
@@ -75,6 +81,8 @@ CLASS_NAMES = (
     "ostracod",
     "aggregate grain",
     "brachiopod",
+    "sponge",
+    "watermark",
 )
 DEFAULT_GDRIVE_LABELED_IMG_DIR = (
     "/content/drive/My Drive/Petrographic images_ML work/labelled images_PS/labelledDataset_02032026/my_dataset/img"
@@ -165,7 +173,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--ignore_scale_bar",
         action="store_true",
-        help=f"Remap mask class {SCALE_BAR_CLASS_ID} (scale bar) to ignore_index so it is not learned.",
+        help=f"Remap mask class {SCALE_BAR_CLASS_ID} (scale bar) to ignore_index so it is not learned. "
+        "Subset of --ignore_artifacts; kept for backward compatibility.",
+    )
+    p.add_argument(
+        "--ignore_artifacts",
+        action="store_true",
+        help=f"Remap all non-biological artifact classes {ARTIFACT_CLASS_IDS} "
+        "(scale bar, watermark) to ignore_index so they are excluded from loss and metrics. "
+        "Takes precedence over --ignore_scale_bar.",
     )
     p.add_argument(
         "--class_weights",
@@ -237,6 +253,18 @@ def default_data_root() -> Path:
     return here.parent.parent / "data" / "carbonate_imgs_and_masks"
 
 
+def artifact_ignore_ids(args: argparse.Namespace) -> tuple[int, ...]:
+    """Resolve which class ids to remap to ignore_index from the CLI flags.
+
+    --ignore_artifacts (all artifacts) takes precedence over --ignore_scale_bar (scale bar only).
+    """
+    if getattr(args, "ignore_artifacts", False):
+        return ARTIFACT_CLASS_IDS
+    if getattr(args, "ignore_scale_bar", False):
+        return (SCALE_BAR_CLASS_ID,)
+    return ()
+
+
 def kfold_train_val_indices(n: int, n_folds: int, seed: int) -> list[tuple[np.ndarray, np.ndarray]]:
     """Return list of (train_idx, val_idx) for each fold; shuffled, stratification-free."""
     if n_folds < 2:
@@ -256,12 +284,12 @@ def build_class_presence_matrix(
     pairs: list[tuple[Path, Path]],
     num_classes: int,
     ignore_index: int,
-    ignore_scale_bar: bool,
+    ignore_class_ids: tuple[int, ...] = (),
 ) -> np.ndarray:
     """Binary [n_samples, num_classes] matrix: 1 where class c is present in image i's mask.
 
     Reads masks at full resolution (no crop transforms), so presence reflects the whole
-    image. Mirrors the scale-bar remapping in CarbonateSegmentationDataset.__getitem__ so a
+    image. Mirrors the artifact remapping in CarbonateSegmentationDataset.__getitem__ so a
     class remapped to ignore_index is not counted as present.
     """
     n = len(pairs)
@@ -271,9 +299,10 @@ def build_class_presence_matrix(
         if mask.ndim == 3 and mask.shape[0] > 1:
             mask = mask[0:1, ...]
         mask = mask.squeeze(0).to(torch.long)
-        if ignore_scale_bar:
+        if ignore_class_ids:
             mask = mask.clone()
-            mask[mask == SCALE_BAR_CLASS_ID] = ignore_index
+            for cid in ignore_class_ids:
+                mask[mask == cid] = ignore_index
         for v in torch.unique(mask).tolist():
             if 0 <= v < num_classes:
                 presence[i, v] = 1
@@ -463,14 +492,14 @@ class CarbonateSegmentationDataset(torch.utils.data.Dataset):
         transforms=None,
         normalize: bool = True,
         strict: bool = True,
-        ignore_scale_bar: bool = False,
+        ignore_class_ids: tuple[int, ...] = (),
         ignore_index: int = IGNORE_INDEX,
         print_pair_count: bool = True,
     ):
         self.root = Path(root)
         self.transforms = transforms
         self.normalize = normalize
-        self.ignore_scale_bar = ignore_scale_bar
+        self.ignore_class_ids = tuple(ignore_class_ids)
         self.ignore_index = ignore_index
         self._print_pair_count = print_pair_count
 
@@ -513,9 +542,10 @@ class CarbonateSegmentationDataset(torch.utils.data.Dataset):
 
         mask = mask.squeeze(0).to(torch.long)
 
-        if self.ignore_scale_bar:
+        if self.ignore_class_ids:
             mask = mask.clone()
-            mask[mask == SCALE_BAR_CLASS_ID] = self.ignore_index
+            for cid in self.ignore_class_ids:
+                mask[mask == cid] = self.ignore_index
 
         img = tv_tensors.Image(img)
         sem_mask = tv_tensors.Mask(mask)
@@ -890,6 +920,7 @@ def run_single_fold(
     fold_dir.mkdir(parents=True, exist_ok=True)
     tag = f"Fold {fold + 1}/{n_folds} | " if n_folds >= 2 else ""
 
+    ignore_ids = artifact_ignore_ids(args)
     crop = args.crop
     train_transforms = Compose(
         [
@@ -907,7 +938,7 @@ def run_single_fold(
         transforms=train_transforms,
         normalize=True,
         strict=False,
-        ignore_scale_bar=args.ignore_scale_bar,
+        ignore_class_ids=ignore_ids,
         print_pair_count=False,
     )
     val_full = CarbonateSegmentationDataset(
@@ -917,7 +948,7 @@ def run_single_fold(
         transforms=val_transforms,
         normalize=True,
         strict=False,
-        ignore_scale_bar=args.ignore_scale_bar,
+        ignore_class_ids=ignore_ids,
         print_pair_count=False,
     )
 
@@ -1022,7 +1053,7 @@ def run_single_fold(
                     "focal_gamma": args.focal_gamma,
                     "auto_class_weights": args.auto_class_weights,
                     "class_weights_path": args.class_weights,
-                    "ignore_scale_bar": args.ignore_scale_bar,
+                    "ignore_class_ids": list(ignore_ids),
                     "crop": args.crop,
                     "n_folds": n_folds,
                     "fold": fold,
@@ -1215,6 +1246,11 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    ignore_ids = artifact_ignore_ids(args)
+    if ignore_ids:
+        names = ", ".join(f"{c}:{CLASS_NAMES[c]}" for c in ignore_ids if c < len(CLASS_NAMES))
+        print(f"[config] Ignoring artifact classes (remapped to {IGNORE_INDEX}): {names}")
+
     probe = CarbonateSegmentationDataset(
         data_root,
         img_dir=img_dir if use_explicit_dirs else None,
@@ -1222,7 +1258,7 @@ def main() -> None:
         transforms=None,
         normalize=True,
         strict=True,
-        ignore_scale_bar=args.ignore_scale_bar,
+        ignore_class_ids=ignore_ids,
     )
     n = len(probe)
 
@@ -1253,7 +1289,7 @@ def main() -> None:
 
     presence: np.ndarray | None = None
     if args.cv_strategy == "stratified":
-        presence = build_class_presence_matrix(probe.pairs, NUM_CLASSES, IGNORE_INDEX, args.ignore_scale_bar)
+        presence = build_class_presence_matrix(probe.pairs, NUM_CLASSES, IGNORE_INDEX, ignore_ids)
         report_class_fold_feasibility(presence, args.n_folds)
         splits = stratified_kfold_indices(presence, args.n_folds, args.seed)
         # Show how many classes each validation fold actually covers.

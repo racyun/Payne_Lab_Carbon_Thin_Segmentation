@@ -1,11 +1,11 @@
 # Swin Transformer + UPerNet Segmentation Model
 
-This document walks through the full model architecture used in the carbonate-thin-section segmentation pipeline, from self-supervised pretraining on unlabeled petrographic imagery through supervised finetuning for 16-class semantic segmentation. It is written to be technically complete but readable without a computer-vision background; terms are defined where they first appear.
+This document walks through the full model architecture used in the carbonate-thin-section segmentation pipeline, from self-supervised pretraining on unlabeled petrographic imagery through supervised finetuning for 18-class semantic segmentation. It is written to be technically complete but readable without a computer-vision background; terms are defined where they first appear.
 
 The pipeline has two training stages, implemented in two scripts:
 
 1. **Masked self-supervised (SSL) pretraining** — [swin_ssl_pretrain_221.py](swin_ssl_pretrain_221.py). Trains the Swin backbone alone to reconstruct hidden parts of unlabeled carbonate images.
-2. **Supervised finetuning** — [swin_training_pipeline_221.py](swin_training_pipeline_221.py). Attaches a UPerNet decoder on top of the pretrained Swin backbone and trains end-to-end on labeled masks (16 classes) with cross-entropy loss.
+2. **Supervised finetuning** — [swin_training_pipeline_221.py](swin_training_pipeline_221.py). Attaches a UPerNet decoder on top of the pretrained Swin backbone and trains end-to-end on labeled masks (18 classes) with cross-entropy loss.
 
 The two stages are connected by a weight-transfer step: the backbone learned in stage (1) is loaded into the encoder of stage (2) via `--backbone_checkpoint`, so stage (2) starts from a backbone that already "understands" carbonate textures rather than a generic ImageNet one.
 
@@ -30,12 +30,13 @@ Stage 2: Supervised Finetuning (Swin + UPerNet)
  Pretrained Swin backbone weights
        │
        ▼
- Fine-tune on labeled 16-class masks (cross-entropy, optional class weights)
+ Fine-tune on labeled 18-class masks (cross-entropy, optional class weights)
        │
        ▼
- Per-pixel predictions across 16 carbonate classes (background, bivalves, micrite, cement,
+ Per-pixel predictions across 18 carbonate classes (background, bivalves, micrite, cement,
  echinoderms, forams, calc. algae, peloids, unid biota, ooids, gastropods, scale bar,
- mollusks, ostracods, aggregate grains, brachiopods)
+ mollusks, ostracods, aggregate grains, brachiopods, sponge, watermark)
+ (scale bar and watermark are acquisition artifacts, not geology — see --ignore_artifacts below)
 ```
 
 ### End-to-end architecture (detailed)
@@ -71,7 +72,7 @@ Stage 2: Supervised Finetuning (Swin + UPerNet)
 │              │  0–2, so fine detail and global context are combined          │          │
 │              └───────────────────────────────┬───────────────────────────────┘          │
 │                                              ▼                                           │
-│                       per-pixel 16-class prediction (512×512)                            │
+│                       per-pixel 18-class prediction (512×512)                            │
 │                                              │                                           │
 │                                              ▼                                           │
 │                       cross-entropy vs. ground-truth mask                                │
@@ -136,11 +137,11 @@ The SSL checkpoint stores the backbone weights under the key `backbone_state`, a
 
 At the start of finetuning, `load_ssl_backbone_checkpoint` ([swin_training_pipeline_221.py:175-201](swin_training_pipeline_221.py)) reads that dictionary and calls `model.backbone.load_state_dict(..., strict=False)`. The `strict=False` is intentional: the SSL backbone and the UPerNet backbone are the same architecture (SwinV2-Tiny), but the hierarchical-feature adapter that UPerNet inserts can add a few small keys; `strict=False` lets the compatible ones load cleanly and reports anything that did not match, rather than crashing.
 
-After this step, only the *encoder* has been initialized from SSL. The UPerNet decoder still starts from random weights. That is by design: the decoder is task-specific (it outputs class logits for our 16 classes), so there is nothing in SSL for it to inherit. The next stage trains everything together.
+After this step, only the *encoder* has been initialized from SSL. The UPerNet decoder still starts from random weights. That is by design: the decoder is task-specific (it outputs class logits for our 18 classes), so there is nothing in SSL for it to inherit. The next stage trains everything together.
 
 ---
 
-## 2. Stage-2 — Supervised finetuning for 16-class segmentation
+## 2. Stage-2 — Supervised finetuning for 18-class segmentation
 
 The goal of this stage is to produce a per-pixel class prediction for each image, across the following 16 labels:
 
@@ -201,11 +202,11 @@ Carbonate thin sections are *simultaneously* small-scale and large-scale problem
 
 A single-scale model (either a plain CNN operating at one resolution or a plain ViT attending globally to flat patches) has to compromise. Swin's hierarchy keeps all four scales alive; UPerNet's fusion ensures the final per-pixel decision uses all of them. In practice this means the model can draw a sharp boundary around a shell fragment (fine scale) *while* correctly classifying it as bivalve vs. brachiopod (regional scale) *while* respecting that the surrounding matrix is micrite and the cement-filled void is not (global scale).
 
-A second practical benefit: because the backbone was pretrained to reconstruct carbonate imagery, each stage's features are already tuned to the visual statistics of our domain before any masks are seen. The finetuner's job is largely to teach the decoder how to map those features onto *our* 16 classes, rather than teaching the encoder what carbonates look like from scratch.
+A second practical benefit: because the backbone was pretrained to reconstruct carbonate imagery, each stage's features are already tuned to the visual statistics of our domain before any masks are seen. The finetuner's job is largely to teach the decoder how to map those features onto *our* 18 classes, rather than teaching the encoder what carbonates look like from scratch.
 
 ### 2.4 Training details (finetuning)
 
-- **Data loading.** Pairs `img/` with `masks/` by filename stem ([swin_training_pipeline_221.py:224-309](swin_training_pipeline_221.py)). Masks are single-channel integer images with values 0–15. The scale-bar class (11) can optionally be remapped to an ignore index (`--ignore_scale_bar`) so the model is not penalized or rewarded for it — useful because scale bars are an artifact of image acquisition, not geology.
+- **Data loading.** Pairs `img/` with `masks/` by filename stem ([swin_training_pipeline_221.py:224-309](swin_training_pipeline_221.py)). Masks are single-channel integer images with values 0–17. Two classes are non-biological acquisition artifacts — scale bar (11) and watermark (17). Pass `--ignore_artifacts` to remap **both** to an ignore index so the model is neither penalized nor rewarded for them, and they are excluded from per-class metrics. (`--ignore_scale_bar` is kept as a backward-compatible subset that ignores only the scale bar.)
 - **Augmentation.** `RandomCrop(512)` + horizontal and vertical flips for training; `CenterCrop(512)` for validation. Flips are safe because carbonate thin sections have no inherent orientation.
 - **Loss.** Cross-entropy per pixel, with optional class weights (`--class_weights` from a `.npy` file or `--auto_class_weights` computed inverse-frequency on the training split, [swin_training_pipeline_221.py:204-221](swin_training_pipeline_221.py)). Weighting matters because micrite and cement occupy vastly more pixels than, say, brachiopods; unweighted loss would let the model ignore rare classes.
 - **Optimizer.** AdamW with weight decay; optional cosine or step LR schedule.
@@ -231,7 +232,7 @@ python code/model_training_pipeline/swin_training_pipeline_221.py \
   --data_root data/carbonate_imgs_and_masks \
   --backbone_checkpoint runs/ssl/ssl_swinv2_best.pth \
   --epochs 20 --batch_size 2 --crop 512 \
-  --auto_class_weights --ignore_scale_bar \
+  --auto_class_weights --ignore_artifacts \
   --output_dir runs/finetune
 ```
 
