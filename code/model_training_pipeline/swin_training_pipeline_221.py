@@ -8,6 +8,9 @@ Default: 16 classes (labels 0–15). Trains with AdamW; saves best checkpoint by
 By default this runs 5-fold cross-validation (``--n_folds 5``): each fold trains a fresh
 model on 4/5 of the data and validates on the held-out 1/5, writing per-fold checkpoints
 under ``<output_dir>/fold_<i>/`` and an aggregate ``cv_summary.json`` (mean/std mIoU).
+Folds are built by multi-label *stratification* over per-image class presence
+(``--cv_strategy stratified``, the default) so each class is spread as evenly as possible
+across folds; pass ``--cv_strategy random`` for a plain shuffled split.
 Set ``--n_folds 1`` to fall back to a single train/val split governed by ``--val_frac``.
 
 Run locally::
@@ -140,6 +143,16 @@ def parse_args() -> argparse.Namespace:
         "Useful for parallelizing folds across separate sessions.",
     )
     p.add_argument(
+        "--cv_strategy",
+        type=str,
+        default="stratified",
+        choices=["stratified", "random"],
+        help="How to build the K folds. 'stratified' = multi-label iterative stratification "
+        "over per-image class presence, spreading each class as evenly as possible across folds "
+        "(every class with >=2 images lands in all K training folds). 'random' = plain shuffled "
+        "split (legacy). Only used when --n_folds >= 2.",
+    )
+    p.add_argument(
         "--val_frac",
         type=float,
         default=0.2,
@@ -235,6 +248,128 @@ def kfold_train_val_indices(n: int, n_folds: int, seed: int) -> list[tuple[np.nd
     for f in range(n_folds):
         val_idx = parts[f]
         train_idx = np.concatenate([parts[j] for j in range(n_folds) if j != f])
+        splits.append((train_idx.astype(np.int64), val_idx.astype(np.int64)))
+    return splits
+
+
+def build_class_presence_matrix(
+    pairs: list[tuple[Path, Path]],
+    num_classes: int,
+    ignore_index: int,
+    ignore_scale_bar: bool,
+) -> np.ndarray:
+    """Binary [n_samples, num_classes] matrix: 1 where class c is present in image i's mask.
+
+    Reads masks at full resolution (no crop transforms), so presence reflects the whole
+    image. Mirrors the scale-bar remapping in CarbonateSegmentationDataset.__getitem__ so a
+    class remapped to ignore_index is not counted as present.
+    """
+    n = len(pairs)
+    presence = np.zeros((n, num_classes), dtype=np.uint8)
+    for i, (_, mask_path) in enumerate(pairs):
+        mask = read_image(str(mask_path))
+        if mask.ndim == 3 and mask.shape[0] > 1:
+            mask = mask[0:1, ...]
+        mask = mask.squeeze(0).to(torch.long)
+        if ignore_scale_bar:
+            mask = mask.clone()
+            mask[mask == SCALE_BAR_CLASS_ID] = ignore_index
+        for v in torch.unique(mask).tolist():
+            if 0 <= v < num_classes:
+                presence[i, v] = 1
+    return presence
+
+
+def report_class_fold_feasibility(presence: np.ndarray, n_folds: int) -> None:
+    """Print per-class image counts and warn about classes too rare to cover every fold."""
+    counts = presence.sum(axis=0).astype(int)
+    num_classes = presence.shape[1]
+    print(f"[cv] Stratified {n_folds}-fold over multi-label class presence ({presence.shape[0]} images).")
+    print(
+        "[cv] Per-class image counts: "
+        + ", ".join(
+            f"{(CLASS_NAMES[c] if c < len(CLASS_NAMES) else c)}={int(counts[c])}"
+            for c in range(num_classes)
+            if counts[c] > 0
+        )
+    )
+    rare = [c for c in range(num_classes) if 0 < counts[c] < n_folds]
+    absent = [c for c in range(num_classes) if counts[c] == 0]
+    if rare:
+        print(
+            f"[cv][warn] {len(rare)} class(es) appear in fewer than {n_folds} images, so they "
+            "cannot be present in every validation fold (continuing best-effort):"
+        )
+        for c in rare:
+            name = CLASS_NAMES[c] if c < len(CLASS_NAMES) else f"class_{c}"
+            print(f"    - {c:02d} {name}: in {int(counts[c])} image(s)")
+    if absent:
+        names = ", ".join((CLASS_NAMES[c] if c < len(CLASS_NAMES) else str(c)) for c in absent)
+        print(f"[cv] Note: {len(absent)} class(es) absent from the dataset entirely: {names}")
+
+
+def stratified_kfold_indices(
+    presence: np.ndarray, n_folds: int, seed: int
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Multi-label iterative stratification (Sechidis et al. 2011).
+
+    Assigns each sample to one validation fold so that, for every class, its images are
+    spread as evenly as possible across the K folds. Returns (train_idx, val_idx) per fold,
+    matching the kfold_train_val_indices API. Deterministic given ``seed`` (used only for
+    tie-breaking).
+    """
+    if n_folds < 2:
+        raise ValueError("n_folds must be >= 2")
+    n, num_classes = presence.shape
+    rng = np.random.RandomState(seed)
+
+    # Desired number of samples per fold, and desired count of each class per fold.
+    fold_capacity = np.full(n_folds, n / n_folds, dtype=float)
+    desired = np.outer(np.ones(n_folds), presence.sum(axis=0).astype(float)) / n_folds
+
+    fold_of = np.full(n, -1, dtype=int)
+    remaining = np.ones(n, dtype=bool)
+
+    def pick_fold(candidates: np.ndarray) -> int:
+        """Among candidate folds, prefer most remaining capacity; break ties randomly."""
+        caps = fold_capacity[candidates]
+        best = candidates[caps == caps.max()]
+        return int(best[rng.randint(best.size)])
+
+    while remaining.any():
+        rem_idx = np.where(remaining)[0]
+        rem_label_counts = presence[rem_idx].sum(axis=0).astype(float)
+        positive = np.where(rem_label_counts > 0)[0]
+
+        if positive.size == 0:
+            # Label-free leftovers (e.g. a mask that is all ignore): place by capacity.
+            for i in rem_idx:
+                j = pick_fold(np.arange(n_folds))
+                fold_of[i] = j
+                fold_capacity[j] -= 1
+                remaining[i] = False
+            break
+
+        # Rarest still-unassigned label first (ties -> smallest class id).
+        label = int(positive[np.argmin(rem_label_counts[positive])])
+        samples = rem_idx[presence[rem_idx, label] > 0]
+        for i in samples:
+            if not remaining[i]:
+                continue
+            col = desired[:, label]
+            cand = np.where(col == col.max())[0]
+            j = pick_fold(cand)
+            fold_of[i] = j
+            remaining[i] = False
+            present_labels = np.where(presence[i] > 0)[0]
+            desired[j, present_labels] -= 1.0
+            fold_capacity[j] -= 1.0
+
+    all_idx = np.arange(n)
+    splits: list[tuple[np.ndarray, np.ndarray]] = []
+    for f in range(n_folds):
+        val_idx = np.sort(all_idx[fold_of == f])
+        train_idx = np.sort(all_idx[fold_of != f])
         splits.append((train_idx.astype(np.int64), val_idx.astype(np.int64)))
     return splits
 
@@ -1116,7 +1251,18 @@ def main() -> None:
     if n < args.n_folds:
         raise SystemExit(f"Need at least {args.n_folds} samples for {args.n_folds}-fold CV; found {n}.")
 
-    splits = kfold_train_val_indices(n, args.n_folds, args.seed)
+    presence: np.ndarray | None = None
+    if args.cv_strategy == "stratified":
+        presence = build_class_presence_matrix(probe.pairs, NUM_CLASSES, IGNORE_INDEX, args.ignore_scale_bar)
+        report_class_fold_feasibility(presence, args.n_folds)
+        splits = stratified_kfold_indices(presence, args.n_folds, args.seed)
+        # Show how many classes each validation fold actually covers.
+        for f, (_, va) in enumerate(splits):
+            covered = int((presence[va].sum(axis=0) > 0).sum())
+            present_total = int((presence.sum(axis=0) > 0).sum())
+            print(f"[cv] fold {f}: val n={len(va)} covers {covered}/{present_total} present classes")
+    else:
+        splits = kfold_train_val_indices(n, args.n_folds, args.seed)
 
     if args.fold is not None:
         if args.fold < 0 or args.fold >= args.n_folds:
@@ -1127,7 +1273,7 @@ def main() -> None:
 
     print(
         f"[config] Multiclass UPerNet+SwinV2 | {args.n_folds}-fold cross-validation | "
-        f"seed={args.seed} | folds_to_run={folds_to_run} | n={n}"
+        f"strategy={args.cv_strategy} | seed={args.seed} | folds_to_run={folds_to_run} | n={n}"
     )
 
     all_best: list[dict] = []
