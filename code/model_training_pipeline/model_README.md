@@ -112,7 +112,7 @@ To fill in a hidden ooid or a missing echinoderm ossicle, the backbone has to le
 - What carbonate textures look like at multiple scales (micrite matrix vs. sparry cement vs. skeletal material).
 - How grains are shaped, oriented, and spatially arranged.
 - What kinds of neighborhoods are consistent (e.g., cement rims around grains, laminated micrite, peloidal packstones).
-- Color, brightness, and birefringence statistics under our imaging setup.
+- Color, brightness, and relief (refractive-index contrast) statistics under our plane-polarized (PPL) imaging setup.
 
 None of that requires a human label. The model discovers it by being forced to predict missing parts of real images. These priors are more useful for our downstream task than ImageNet priors (which are tuned to cats, cars, and people), because they come from exactly the visual world our segmenter will work in.
 

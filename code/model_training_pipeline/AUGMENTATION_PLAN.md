@@ -31,8 +31,27 @@ The class statistics (71 images) expose three distinct problems that drive the w
 ## Non-goals (for now)
 
 - Instance / panoptic segmentation (current model is semantic; see caveat below).
-- PPL/XPL synthetic recoloring (high risk to diagnostic color; deferred).
+- Polarization-mode simulation (PPL↔XPL recoloring) — **not applicable**: the dataset is a
+  single modality (all PPL), so there is no cross-mode robustness to train for.
 - Changing the model architecture or the SSL pretraining stage.
+
+## Imaging modality: plane-polarized light (PPL)
+
+All images are **plane-polarized (PPL)**, not cross-polarized (XPL). This is load-bearing for the
+photometric strategy and reverses the color caution in earlier drafts:
+
+- **Color is only weakly diagnostic.** PPL carbonate sections are low-chroma (gray/brown); class
+  identity comes from **texture, relief, and grain morphology**, not interference color. So
+  hue/saturation/color augmentation is *safe to push hard* — there is no XPL birefringence signal
+  to protect.
+- **Lighting / white-balance varies per image** (different microscope setups and sessions). We
+  want the model robust to that, not dependent on it — this motivates white-balance (RGBShift)
+  and random-grayscale augmentations below.
+- **Rotations are fully valid.** PPL grains have no rotation-dependent color (unlike XPL
+  extinction), so RandomAffine rotations introduce no optical artifacts — proceed freely.
+- **Phase 3 is easier.** Because PPL grains are rotationally invariant in color, synthetic
+  compositing does not need to match optical crystallography; only edge-boundary blending matters
+  (see Phase 3).
 
 ## Correctness invariants (apply to every augmentation)
 
@@ -45,7 +64,9 @@ The class statistics (71 images) expose three distinct problems that drive the w
    indices**. This forces them to live inside `run_single_fold` (after the split), not in a
    global transform. Violating this leaks validation grains into training and inflates CV mIoU.
 3. **Validation transforms stay deterministic** (center-crop only). Augment train folds only.
-4. **Color is diagnostic** (XPL interference colors): photometric jitter stays mild.
+4. **Photometric augmentation can be aggressive** (see *Imaging modality: PPL* above). Color is
+   weakly diagnostic under PPL, so hue/saturation/RGB shifts are safe; what must be preserved is
+   **texture and relief**, which carry the class signal.
 5. **Magnification consistency**: mosaic/scale must not mix magnifications (filenames show
    "4x", "2x detail"), or grain sizes become physically impossible.
 6. **Artifacts** (Scale Bar, Watermark) route to `ignore_index` and are never used as
@@ -75,14 +96,25 @@ in the code today. Before any augmentation:
 These slot into the `train_transforms` Compose built in `run_single_fold`; validation transforms
 unchanged. All are single-image, mask-aware.
 
-- **Geometric (image+mask):** RandomAffine (rotate ±, scale ~0.8–1.2 within a magnification
-  band, shear small, translate small) with mask fill = ignore. Keep existing H/V flips.
+- **Geometric (image+mask):** RandomAffine (**rotation now fully valid under PPL — proceed**;
+  scale ~0.8–1.2 within a magnification band, shear small, translate small) with mask fill =
+  ignore. Keep existing H/V flips.
 - **Rare-class-aware crop** (new custom transform): with probability `p`, choose the crop
   window to contain a randomly selected rare-class pixel (from a configurable rare-class set);
   otherwise crop randomly. This directly addresses the "tiny objects never appear in crops"
   problem and is likely the single highest-impact item given the stats.
-- **Photometric (image only, mild):** brightness/contrast, gamma, hue/saturation (bounded),
-  Gaussian noise, Gaussian blur, CLAHE / histogram equalization.
+- **Photometric (image only) — can be pushed harder under PPL (see modality note):**
+  - **Hue / saturation / color jitter** — re-enabled with wider ranges; PPL color is
+    non-diagnostic, so this is safe rather than risky.
+  - **RGBShift** — randomly shift per-channel intensities to simulate different white-balances
+    (≈ different microscope setups / illumination sources). Flagged as *worth trying* — may or
+    may not keep, but high-value to evaluate for cross-setup robustness.
+  - **Random grayscale (~10% of samples)** — drop color entirely on a fraction of images,
+    forcing the model to rely on grayscale texture and not overfit to per-image lighting/white-
+    balance (lighting conditions differ image to image, so the model should not depend on them).
+  - **Brightness / contrast, gamma, CLAHE / histogram equalization** — the highest-value
+    photometric augs for low-chroma PPL data.
+  - **Gaussian noise / blur** — mild; sensor and focus variation.
 
 **Where it lives:** `CarbonateSegmentationDataset.transforms` pipeline. The rare-class crop needs
 the mask to pick a center, which the joint `transforms(img, mask)` signature already provides.
@@ -99,9 +131,15 @@ training Subset, so sources are train-only.
 
 ## Phase 3 — Synthetic compositing (high effort, high payoff for rare classes)
 
+> **PPL makes this much more tractable.** Because PPL grains are rotationally invariant in color,
+> compositing does not need to match optical crystallography (orientation-dependent extinction/
+> interference). The only realism concern is the **edge boundary** — use Gaussian feathering, or
+> Albumentations' `CopyPaste` with blending, to avoid hard seams. This lowers the bar for
+> attempting Phase 3 after Phase 2 lands.
+
 - **Copy-paste grain compositing:** cut instances of target rare classes (Brachiopod, Mollusk,
-  Aggregate Grain, Gastropods) from training images and paste—with edge blending—onto other
-  training matrices; update the mask accordingly. **Fold-safe sourcing is mandatory.**
+  Aggregate Grain, Gastropods) from training images and paste—with feathered/blended edges—onto
+  other training matrices; update the mask accordingly. **Fold-safe sourcing is mandatory.**
 - **Synthetic occlusion:** CoarseDropout-style patches filled with matrix/cement texture over
   grains; occluded mask region becomes the matrix/cement label (teaches partial-grain recognition).
 - **Matrix/cement texture swap:** composite grains onto different matrix backgrounds; hardest to
@@ -110,9 +148,12 @@ training Subset, so sources are train-only.
 ## Library decision (recommended default)
 
 Use **torchvision `transforms.v2`** for Phases 0–1 (already integrated via `tv_tensors`, no new
-dependency; covers everything except CLAHE, which we can implement or pull narrowly). Introduce
-**Albumentations** only if/when we want its richer set (CLAHE, ElasticTransform, GridDistortion,
-CoarseDropout) for Phases 2–3. Mosaic and copy-paste are custom in either library.
+dependency). It covers the geometric augs, ColorJitter (hue/sat/brightness/contrast), and
+`RandomGrayscale` directly. Two of the new PPL photometric items — **RGBShift** and **CLAHE** —
+are not in torchvision; each is a few lines of custom transform, or we pull **Albumentations**
+for them. Introduce Albumentations if/when we want its richer set (CLAHE, RGBShift,
+ElasticTransform, GridDistortion, CoarseDropout, `CopyPaste`) for Phases 2–3. Mosaic and grain
+copy-paste are custom regardless of library.
 
 *(Open decision — can switch to Albumentations-first if you prefer fewer custom transforms.)*
 
@@ -121,6 +162,8 @@ CoarseDropout) for Phases 2–3. Mosaic and copy-paste are custom in either libr
 - `--aug_level {none,light,medium,heavy}` preset, plus granular overrides:
 - `--rare_crop_prob`, `--rare_classes <ids>`, `--mosaic_prob`, `--mosaic_n {2,4}`,
   `--copypaste_prob`, `--occlusion_prob`, photometric magnitudes.
+- PPL photometric controls: `--color_jitter` magnitudes (hue/sat/brightness/contrast),
+  `--rgbshift_prob` (white-balance simulation), `--grayscale_prob` (default ~0.1).
 - `--dump_aug_samples N` — write N augmented image+mask overlays to `<output_dir>/aug_preview/`
   for visual QA (critical for verifying realism before a long run).
 
