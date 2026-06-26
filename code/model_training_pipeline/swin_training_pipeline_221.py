@@ -547,6 +547,15 @@ class CarbonateSegmentationDataset(torch.utils.data.Dataset):
             for cid in self.ignore_class_ids:
                 mask[mask == cid] = self.ignore_index
 
+        # Defensive: any label outside the [0, NUM_CLASSES) scheme cannot be predicted by
+        # the model's NUM_CLASSES logits and would crash the loss (CUDA assertion
+        # "cur_target < n_classes"). Map such stray labels to ignore_index. NOTE: this
+        # silently drops out-of-range labels — if a mask systematically uses a new class
+        # id >= NUM_CLASSES, that's a labeling/scheme issue to resolve, not stray pixels.
+        oob = (mask >= NUM_CLASSES) & (mask != self.ignore_index)
+        if bool(oob.any()):
+            mask[oob] = self.ignore_index
+
         img = tv_tensors.Image(img)
         sem_mask = tv_tensors.Mask(mask)
 
