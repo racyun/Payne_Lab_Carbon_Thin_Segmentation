@@ -926,9 +926,18 @@ def run_single_fold(
         [
             RandomHorizontalFlip(p=0.5),
             RandomVerticalFlip(p=0.2),
-            RandomCrop((crop, crop)),
+            # pad_if_needed: some labeled images (e.g. in ALL_LABELS) are smaller than
+            # `crop` in a dimension; pad up to the crop size, filling the mask with
+            # ignore_index so padded borders are not learned as a real class.
+            RandomCrop(
+                (crop, crop),
+                pad_if_needed=True,
+                fill={tv_tensors.Mask: IGNORE_INDEX, "others": 0},
+            ),
         ]
     )
+    # CenterCrop already pads (with 0) when an image is smaller than the crop, so it
+    # does not crash on sub-crop images; padded mask borders default to class 0.
     val_transforms = Compose([CenterCrop((crop, crop))])
 
     train_full = CarbonateSegmentationDataset(
