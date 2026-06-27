@@ -7,8 +7,8 @@ Default: 18 classes (labels 0–17). Trains with AdamW; saves best checkpoint by
 Classes 11 (scale bar) and 17 (watermark) are non-biological artifacts; pass
 ``--ignore_artifacts`` to remap them to ignore_index so they are excluded from the loss.
 
-By default this runs 5-fold cross-validation (``--n_folds 5``): each fold trains a fresh
-model on 4/5 of the data and validates on the held-out 1/5, writing per-fold checkpoints
+By default this runs 3-fold cross-validation (``--n_folds 3``): each fold trains a fresh
+model on 2/3 of the data and validates on the held-out 1/3, writing per-fold checkpoints
 under ``<output_dir>/fold_<i>/`` and an aggregate ``cv_summary.json`` (mean/std mIoU).
 Folds are built by multi-label *stratification* over per-image class presence
 (``--cv_strategy stratified``, the default) so each class is spread as evenly as possible
@@ -139,8 +139,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--n_folds",
         type=int,
-        default=5,
-        help="K for K-fold cross-validation (default 5). Set to 1 (or 0) to use a single "
+        default=3,
+        help="K for K-fold cross-validation (default 3). Set to 1 (or 0) to use a single "
         "train/val split governed by --val_frac instead.",
     )
     p.add_argument(
