@@ -99,6 +99,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     total = 0
+    skipped = 0
     for sub in args.subfolders:
         base = src_root / sub
         if not base.is_dir():
@@ -111,8 +112,15 @@ def main() -> None:
             rel = p.relative_to(src_root)            # e.g. "TJ photomicrographs/ICA 40.3/img1.jpg"
             name = args.sep.join(rel.parts)          # -> "TJ photomicrographs__ICA 40.3__img1.jpg"
             dest = out_dir / name
-            # Extremely unlikely with full-path flattening, but stay safe on collisions.
             if dest.exists():
+                # Idempotent re-runs: full-path flattening makes names unique, so an
+                # existing dest of the same size means we already collected this file
+                # on a previous run -> skip it (do NOT create a "_1" duplicate).
+                if dest.stat().st_size == p.stat().st_size:
+                    skipped += 1
+                    continue
+                # Different size = a genuine name clash between two distinct files
+                # (essentially impossible with path-flattening, but handle it safely).
                 stem, suf = dest.stem, dest.suffix
                 k = 1
                 while (out_dir / f"{stem}_{k}{suf}").exists():
@@ -128,8 +136,10 @@ def main() -> None:
             total += 1
         print(f"  {sub}: {n} images")
 
-    print(f"\nCollected {total} images -> {out_dir}")
-    if total == 0:
+    print(f"\nCollected {total} new images -> {out_dir}")
+    if skipped:
+        print(f"(skipped {skipped} already-collected images — re-runs are now idempotent)")
+    if total == 0 and skipped == 0:
         print("[error] No images found. Check --src_root or run with --sync_first.")
         return
 
