@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import random
+import re
 from pathlib import Path
 
 import numpy as np
@@ -159,6 +160,20 @@ def parse_args() -> argparse.Namespace:
         "over per-image class presence, spreading each class as evenly as possible across folds "
         "(every class with >=2 images lands in all K training folds). 'random' = plain shuffled "
         "split (legacy). Only used when --n_folds >= 2.",
+    )
+    p.add_argument(
+        "--group_by_stem",
+        action="store_true",
+        help="Keep an image and its augmentations in the SAME fold (no CV leakage). Files are "
+        "grouped by source stem with --group_pattern stripped, so e.g. 00_TK-0.3 and "
+        "00_TK-0.3_aug03 are one group. Use this when training on a pre-augmented dataset.",
+    )
+    p.add_argument(
+        "--group_pattern",
+        type=str,
+        default=r"_aug\d+$",
+        help="Regex stripped from each file stem to derive its group key (default matches the "
+        "'_augNN' suffix written by the augmentation export). Only used with --group_by_stem.",
     )
     p.add_argument(
         "--val_frac",
@@ -401,6 +416,61 @@ def stratified_kfold_indices(
         train_idx = np.sort(all_idx[fold_of != f])
         splits.append((train_idx.astype(np.int64), val_idx.astype(np.int64)))
     return splits
+
+
+def group_members_by_stem(
+    pairs: list[tuple[Path, Path]], pattern: str = r"_aug\d+$"
+) -> list[np.ndarray]:
+    """Group image indices by source stem (with ``pattern`` stripped).
+
+    An original and its augmentations share a base stem once the ``_augNN`` suffix is
+    removed, so e.g. ``00_TK-0.3`` and ``00_TK-0.3_aug03`` land in one group. Returns a list
+    of int64 arrays of image indices, one per group, in first-seen order.
+    """
+    rx = re.compile(pattern)
+    order: dict[str, int] = {}
+    members: list[list[int]] = []
+    for i, (img_path, _) in enumerate(pairs):
+        key = rx.sub("", img_path.stem)
+        if key not in order:
+            order[key] = len(members)
+            members.append([])
+        members[order[key]].append(i)
+    return [np.asarray(m, dtype=np.int64) for m in members]
+
+
+def _expand_group_splits(
+    group_splits: list[tuple[np.ndarray, np.ndarray]], members: list[np.ndarray]
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Convert group-level (train, val) index arrays into image-level index arrays."""
+    out: list[tuple[np.ndarray, np.ndarray]] = []
+    empty = np.array([], dtype=np.int64)
+    for tr_g, va_g in group_splits:
+        tr = np.concatenate([members[int(g)] for g in tr_g]) if len(tr_g) else empty
+        va = np.concatenate([members[int(g)] for g in va_g]) if len(va_g) else empty
+        out.append((np.sort(tr).astype(np.int64), np.sort(va).astype(np.int64)))
+    return out
+
+
+def grouped_kfold_indices(
+    members: list[np.ndarray], n_folds: int, seed: int
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Random K-fold over GROUPS (families), expanded to image indices."""
+    return _expand_group_splits(kfold_train_val_indices(len(members), n_folds, seed), members)
+
+
+def stratified_grouped_kfold_indices(
+    presence: np.ndarray, members: list[np.ndarray], n_folds: int, seed: int
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Stratified K-fold over GROUPS, expanded to image indices.
+
+    Builds a group-level presence row (a class is 'present' in a group if any member has it),
+    stratifies the groups, then expands to image indices — so each family stays in one fold.
+    """
+    gpres = np.zeros((len(members), presence.shape[1]), dtype=presence.dtype)
+    for gi, mem in enumerate(members):
+        gpres[gi] = (presence[mem].sum(axis=0) > 0).astype(presence.dtype)
+    return _expand_group_splits(stratified_kfold_indices(gpres, n_folds, seed), members)
 
 
 def set_seed(seed: int) -> None:
@@ -1302,21 +1372,44 @@ def main() -> None:
     # ------------------------------------------------------------------
     # K-fold cross-validation (default: --n_folds 5).
     # ------------------------------------------------------------------
-    if n < args.n_folds:
+    # Optionally group an image and its augmentations so they never split across folds
+    # (avoids CV leakage when training on a pre-augmented dataset).
+    members: list[np.ndarray] | None = None
+    if args.group_by_stem:
+        members = group_members_by_stem(probe.pairs, args.group_pattern)
+        if len(members) < args.n_folds:
+            raise SystemExit(
+                f"Need at least {args.n_folds} groups for grouped {args.n_folds}-fold CV; "
+                f"found {len(members)} (from {n} images)."
+            )
+        print(
+            f"[cv] group_by_stem: {n} images -> {len(members)} source groups "
+            f"(pattern {args.group_pattern!r}); each family stays in one fold."
+        )
+    elif n < args.n_folds:
         raise SystemExit(f"Need at least {args.n_folds} samples for {args.n_folds}-fold CV; found {n}.")
 
     presence: np.ndarray | None = None
     if args.cv_strategy == "stratified":
         presence = build_class_presence_matrix(probe.pairs, NUM_CLASSES, IGNORE_INDEX, ignore_ids)
         report_class_fold_feasibility(presence, args.n_folds)
+
+    if args.group_by_stem:
+        if args.cv_strategy == "stratified":
+            splits = stratified_grouped_kfold_indices(presence, members, args.n_folds, args.seed)
+        else:
+            splits = grouped_kfold_indices(members, args.n_folds, args.seed)
+    elif args.cv_strategy == "stratified":
         splits = stratified_kfold_indices(presence, args.n_folds, args.seed)
-        # Show how many classes each validation fold actually covers.
-        for f, (_, va) in enumerate(splits):
-            covered = int((presence[va].sum(axis=0) > 0).sum())
-            present_total = int((presence.sum(axis=0) > 0).sum())
-            print(f"[cv] fold {f}: val n={len(va)} covers {covered}/{present_total} present classes")
     else:
         splits = kfold_train_val_indices(n, args.n_folds, args.seed)
+
+    # Show how many classes each validation fold actually covers (stratified only).
+    if presence is not None:
+        present_total = int((presence.sum(axis=0) > 0).sum())
+        for f, (_, va) in enumerate(splits):
+            covered = int((presence[va].sum(axis=0) > 0).sum())
+            print(f"[cv] fold {f}: val n={len(va)} covers {covered}/{present_total} present classes")
 
     if args.fold is not None:
         if args.fold < 0 or args.fold >= args.n_folds:
@@ -1325,9 +1418,10 @@ def main() -> None:
     else:
         folds_to_run = list(range(args.n_folds))
 
+    grp = f" | grouped-by-stem ({len(members)} groups)" if args.group_by_stem else ""
     print(
         f"[config] Multiclass UPerNet+SwinV2 | {args.n_folds}-fold cross-validation | "
-        f"strategy={args.cv_strategy} | seed={args.seed} | folds_to_run={folds_to_run} | n={n}"
+        f"strategy={args.cv_strategy} | seed={args.seed} | folds_to_run={folds_to_run} | n={n}{grp}"
     )
 
     all_best: list[dict] = []
