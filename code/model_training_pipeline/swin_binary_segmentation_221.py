@@ -15,7 +15,11 @@ Run::
 
     python swin_binary_segmentation_221.py --img_dir ... --mask_dir ... --output_dir ...
 
-Requires: torch, torchvision, transformers, tqdm, pillow, numpy.
+Optional Weights & Biases logging (one run per fold, grouped under --wandb_run_name):
+
+    ... --wandb_project payne-carbonate-segmentation --wandb_run_name seg_no_aug_binary_3fold
+
+Requires: torch, torchvision, transformers, tqdm, pillow, numpy (wandb optional).
 """
 
 from __future__ import annotations
@@ -49,6 +53,13 @@ from swin_training_pipeline_221 import (
     stratified_kfold_indices,
     train_one_epoch,
 )
+
+try:
+    import wandb  # noqa: F401
+
+    _WANDB_AVAILABLE = True
+except Exception:  # noqa: BLE001 — wandb is optional
+    _WANDB_AVAILABLE = False
 
 NUM_BINARY_CLASSES = 2
 IGNORE_INDEX = 255
@@ -115,6 +126,32 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="If set, cap training batches per epoch (smoke test).",
+    )
+    p.add_argument(
+        "--wandb_project",
+        type=str,
+        default=None,
+        help="W&B project name. If unset, W&B logging is disabled.",
+    )
+    p.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="Optional W&B run name (auto-generated if unset). Per-fold runs get a '_fold<i>' suffix "
+        "and are grouped under this name.",
+    )
+    p.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="Optional W&B entity (team or user).",
+    )
+    p.add_argument(
+        "--wandb_mode",
+        type=str,
+        default="online",
+        choices=["online", "offline", "disabled"],
+        help="W&B mode (online uploads live; offline writes locally; disabled = no logging).",
     )
     return p.parse_args()
 
@@ -462,10 +499,54 @@ def run_single_fold(
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    # ------------------------------------------------------------------
+    # Weights & Biases setup (one run per fold, grouped under wandb_run_name).
+    # ------------------------------------------------------------------
+    wandb_run = None
+    if args.wandb_project and args.wandb_mode != "disabled":
+        if not _WANDB_AVAILABLE:
+            print("[wandb] wandb not installed; skipping logging. `pip install wandb` to enable.")
+        else:
+            import wandb as _wandb  # local re-import for clarity
+
+            run_name = args.wandb_run_name
+            if n_folds >= 2:
+                run_name = f"{run_name}_fold{fold}" if run_name else f"fold{fold}"
+            wandb_run = _wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=run_name,
+                mode=args.wandb_mode,
+                group=args.wandb_run_name or None,
+                reinit=True,
+                config={
+                    "stage": "finetune",
+                    "task": "binary_grain_vs_background",
+                    "backbone_id": BACKBONE_ID,
+                    "num_classes": NUM_BINARY_CLASSES,
+                    "artifact_ignore_ids": list(ARTIFACT_CLASS_IDS),
+                    "epochs": args.epochs,
+                    "batch_size": args.batch_size,
+                    "lr": args.lr,
+                    "weight_decay": args.weight_decay,
+                    "crop": args.crop,
+                    "n_folds": n_folds,
+                    "fold": fold,
+                    "cv_strategy": args.cv_strategy,
+                    "seed": args.seed,
+                    "ssl_backbone_checkpoint": args.backbone_checkpoint,
+                },
+            )
+            print(f"[wandb] logging to project={args.wandb_project} run={wandb_run.name}")
+
     best_miou = -1.0
     best_row: dict | None = None
     ckpt_path = fold_dir / "best_upernet_swinv2_binary.pth"
     metrics_csv = fold_dir / "val_metrics.csv"
+
+    # In-memory history for the end-of-run composite chart + table.
+    epoch_history: list[int] = []
+    per_class_history: list[list[float]] = [[] for _ in range(NUM_BINARY_CLASSES)]
 
     with metrics_csv.open("w", encoding="utf-8") as f:
         f.write(
@@ -520,6 +601,30 @@ def run_single_fold(
                 f"{100.0*gt_bg:.4f},{100.0*gt_grain:.4f},{100.0*pred_bg:.4f},{100.0*pred_grain:.4f}\n"
             )
 
+        # Track per-class IoU history (used for the end-of-run composite chart + table).
+        epoch_history.append(epoch)
+        per_class_history[0].append(i0)
+        per_class_history[1].append(i1)
+
+        # ------- Weights & Biases per-epoch metrics -------
+        if wandb_run is not None:
+            current_lr = optimizer.param_groups[0]["lr"]
+            log_payload = {
+                "epoch": epoch,
+                "lr": current_lr,
+                "train/loss": tr,
+                "val/loss": va_loss,
+                "val/pixel_acc": va_acc,
+                "val/mIoU": va_miou,
+                "val/gt_grain_pct": 100.0 * gt_grain,
+                "val/pred_grain_pct": 100.0 * pred_grain,
+            }
+            for idx, name in enumerate(BINARY_CLASS_NAMES):
+                v = per_iou[idx].item()
+                if torch.isfinite(per_iou[idx]).item():
+                    log_payload[f"val_iou/{idx:02d}_{name}"] = v
+            wandb_run.log(log_payload, step=epoch)
+
         if va_miou > best_miou:
             best_miou = va_miou
             best_row = {
@@ -546,6 +651,40 @@ def run_single_fold(
             except OSError:
                 saved_p = str(ckpt_path)
             print(f"  saved {saved_p}")
+            if wandb_run is not None:
+                wandb_run.summary["best_val_mIoU"] = best_miou
+                wandb_run.summary["best_epoch"] = epoch
+
+    # ------- End-of-run W&B summary artifacts: composite line chart + table -------
+    if wandb_run is not None and epoch_history:
+        import wandb as _wandb
+
+        ys_per_class = [
+            [None if (isinstance(v, float) and (v != v)) else v for v in series]
+            for series in per_class_history
+        ]
+        try:
+            line_chart = _wandb.plot.line_series(
+                xs=epoch_history,
+                ys=ys_per_class,
+                keys=list(BINARY_CLASS_NAMES),
+                title="Per-class validation IoU across epochs",
+                xname="epoch",
+            )
+            wandb_run.log({"val_iou/per_class_lines": line_chart})
+        except Exception as exc:  # noqa: BLE001 — best-effort, don't kill the run.
+            print(f"[wandb] line_series chart skipped: {exc}")
+
+        try:
+            tbl = _wandb.Table(columns=["epoch"] + list(BINARY_CLASS_NAMES))
+            for row_idx, ep in enumerate(epoch_history):
+                row = [ep] + [per_class_history[c][row_idx] for c in range(NUM_BINARY_CLASSES)]
+                tbl.add_data(*row)
+            wandb_run.log({"val_iou/per_class_table": tbl})
+        except Exception as exc:  # noqa: BLE001
+            print(f"[wandb] per-class table skipped: {exc}")
+
+        wandb_run.finish()
 
     assert best_row is not None
     best_row["fold"] = fold
