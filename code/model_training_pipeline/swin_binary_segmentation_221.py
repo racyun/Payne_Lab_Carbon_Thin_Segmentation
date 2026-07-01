@@ -148,6 +148,20 @@ def parse_args() -> argparse.Namespace:
         "Safe for the binary task since both classes are always present; stacks with focal.",
     )
     p.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=5,
+        help="Linear LR warmup over the first N epochs (0 disables). Stabilizes early training and "
+        "helps prevent collapse to a trivial all-grain / all-background solution.",
+    )
+    p.add_argument(
+        "--scheduler",
+        type=str,
+        default="cosine",
+        choices=["none", "cosine"],
+        help="Post-warmup LR scheduler (mirrors the stable 17-class pipeline).",
+    )
+    p.add_argument(
         "--fold",
         type=int,
         default=None,
@@ -552,6 +566,32 @@ def run_single_fold(
         print("[train] auto class weights:", class_weights.detach().cpu().numpy().round(3).tolist())
     print(f"[train] loss_type={args.loss_type} focal_gamma={args.focal_gamma}")
 
+    # LR schedule: linear warmup -> cosine decay (mirrors the stable 17-class pipeline).
+    # A constant high LR is what let the binary run thrash between all-grain and all-background.
+    scheduler = None
+    main_epochs = max(1, args.epochs - max(0, args.warmup_epochs))
+    main_sched = (
+        optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=main_epochs)
+        if args.scheduler == "cosine"
+        else None
+    )
+    if args.warmup_epochs > 0:
+        warmup_sched = optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-3, end_factor=1.0, total_iters=args.warmup_epochs
+        )
+        scheduler = (
+            warmup_sched
+            if main_sched is None
+            else optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_sched, main_sched],
+                milestones=[args.warmup_epochs],
+            )
+        )
+    else:
+        scheduler = main_sched
+    print(f"[train] scheduler={args.scheduler} warmup_epochs={args.warmup_epochs} lr={args.lr}")
+
     # ------------------------------------------------------------------
     # Weights & Biases setup (one run per fold, grouped under wandb_run_name).
     # ------------------------------------------------------------------
@@ -586,6 +626,8 @@ def run_single_fold(
                     "loss_type": args.loss_type,
                     "focal_gamma": args.focal_gamma,
                     "auto_class_weights": args.auto_class_weights,
+                    "warmup_epochs": args.warmup_epochs,
+                    "scheduler": args.scheduler,
                     "n_folds": n_folds,
                     "fold": fold,
                     "cv_strategy": args.cv_strategy,
@@ -632,7 +674,7 @@ def run_single_fold(
             NUM_BINARY_CLASSES,
             IGNORE_INDEX,
             class_weights,
-            scheduler=None,
+            scheduler=scheduler,
             loss_type=args.loss_type,
             focal_gamma=args.focal_gamma,
         )
