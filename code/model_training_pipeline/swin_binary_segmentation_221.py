@@ -2,11 +2,14 @@
 """
 Binary grain vs background segmentation (SwinV2-Tiny + UPerNet).
 
-Maps original multiclass masks (0=background, 1–15=grain components, 255=ignore) to:
-  0 = non-grain (background)
-  1 = grain (any original class 1–15)
+Maps original 18-class masks (ids 0..17, plus 255=ignore) to:
+  0 = non-grain (background, id 0)
+  1 = grain (any foreground class), EXCLUDING scale bar (11) and watermark (17),
+      which are non-biological artifacts and become ignore.
 
-5-fold cross-validation over image/mask pairs. Metrics: pixel accuracy, mean IoU, per-class IoU.
+Default 3-fold stratified cross-validation (stratified over the original multiclass class
+presence so grain types spread evenly across folds). Metrics: pixel accuracy, mean IoU,
+per-class IoU.
 
 Run::
 
@@ -35,7 +38,17 @@ from tqdm.auto import tqdm
 
 from transformers import UperNetConfig, UperNetForSemanticSegmentation
 
-from swin_training_pipeline_221 import confusion_matrix, miou_from_confusion, pixel_accuracy, set_seed, train_one_epoch
+from swin_training_pipeline_221 import (
+    ARTIFACT_CLASS_IDS,
+    NUM_CLASSES,
+    build_class_presence_matrix,
+    confusion_matrix,
+    miou_from_confusion,
+    pixel_accuracy,
+    set_seed,
+    stratified_kfold_indices,
+    train_one_epoch,
+)
 
 NUM_BINARY_CLASSES = 2
 IGNORE_INDEX = 255
@@ -74,7 +87,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--output_dir", type=str, default=".")
-    p.add_argument("--n_folds", type=int, default=5)
+    p.add_argument("--n_folds", type=int, default=3)
+    p.add_argument(
+        "--cv_strategy",
+        type=str,
+        default="stratified",
+        choices=["stratified", "random"],
+        help="How to build the K folds. 'stratified' = multi-label iterative stratification over "
+        "the ORIGINAL multiclass class presence (so grain TYPES are spread evenly across folds, "
+        "with scale bar/watermark ignored); 'random' = plain shuffled split (legacy).",
+    )
     p.add_argument(
         "--fold",
         type=int,
@@ -118,12 +140,24 @@ def kfold_train_val_indices(n: int, n_folds: int, seed: int) -> list[tuple[np.nd
 
 
 def multiclass_mask_to_binary(mask_long: torch.Tensor) -> torch.Tensor:
-    """0 -> 0 (non-grain), 1–15 -> 1 (grain), 255 -> ignore. Other values -> ignore."""
+    """Grain vs non-grain under the current 18-class scheme (ids 0..17):
+
+      0 (background)                       -> 0 (non-grain)
+      scale bar (11), watermark (17)       -> ignore  (non-biological artifacts)
+      any other in-scheme foreground       -> 1 (grain)   [incl. sponge=16]
+      255 / out-of-range (e.g. stray 19)   -> ignore
+
+    NOTE: the previous version mapped 1..15 -> grain, which wrongly counted the
+    scale bar as a grain and dropped sponge (16). This mirrors --ignore_artifacts
+    in the multiclass pipeline.
+    """
     m = mask_long
     out = torch.full_like(m, IGNORE_INDEX)
-    known = (m >= 0) & (m <= 15)
-    out[known & (m == 0)] = 0
-    out[known & (m >= 1)] = 1
+    in_scheme = (m >= 0) & (m < NUM_CLASSES)
+    out[in_scheme & (m == 0)] = 0            # background -> non-grain
+    out[in_scheme & (m >= 1)] = 1            # foreground -> grain
+    for a in ARTIFACT_CLASS_IDS:             # scale bar + watermark -> ignore
+        out[m == a] = IGNORE_INDEX
     return out
 
 
@@ -363,7 +397,13 @@ def run_single_fold(
         [
             RandomHorizontalFlip(p=0.5),
             RandomVerticalFlip(p=0.2),
-            RandomCrop((crop, crop)),
+            # pad_if_needed: some ALL_LABELS images are smaller than `crop`; pad up to the
+            # crop size, filling the mask border with ignore_index (image with 0).
+            RandomCrop(
+                (crop, crop),
+                pad_if_needed=True,
+                fill={tv_tensors.Mask: IGNORE_INDEX, "others": 0},
+            ),
         ]
     )
     val_tf = Compose([CenterCrop((crop, crop))])
@@ -533,11 +573,17 @@ def main() -> None:
         raise SystemExit(f"Need at least {args.n_folds} samples for {args.n_folds}-fold CV; found {n}.")
 
     print(
-        f"[config] Binary UPerNet+SwinV2 | {args.n_folds}-fold cross-validation | seed={args.seed} | "
-        f"drop_last_train=True (use batch_size>=2 as in multiclass recipe)"
+        f"[config] Binary UPerNet+SwinV2 | {args.n_folds}-fold cross-validation | "
+        f"strategy={args.cv_strategy} | seed={args.seed} | drop_last_train=True"
     )
 
-    split_folds = kfold_train_val_indices(n, args.n_folds, args.seed)
+    # Stratify over the ORIGINAL multiclass presence (grain types spread across folds),
+    # ignoring scale bar + watermark so they don't drive the split.
+    if args.cv_strategy == "stratified":
+        presence = build_class_presence_matrix(probe.pairs, NUM_CLASSES, IGNORE_INDEX, ARTIFACT_CLASS_IDS)
+        split_folds = stratified_kfold_indices(presence, args.n_folds, args.seed)
+    else:
+        split_folds = kfold_train_val_indices(n, args.n_folds, args.seed)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
