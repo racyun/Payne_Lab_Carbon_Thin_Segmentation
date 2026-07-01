@@ -46,7 +46,9 @@ from swin_training_pipeline_221 import (
     ARTIFACT_CLASS_IDS,
     NUM_CLASSES,
     build_class_presence_matrix,
+    compute_seg_loss,
     confusion_matrix,
+    estimate_class_weights_from_dataset,
     group_members_by_stem,
     grouped_kfold_indices,
     miou_from_confusion,
@@ -124,6 +126,26 @@ def parse_args() -> argparse.Namespace:
         default=r"_aug\d+$",
         help="Regex stripped from each file stem to derive its group key (default matches the "
         "'_augNN' suffix written by the augmentation export). Only used with --group_by_stem.",
+    )
+    p.add_argument(
+        "--loss_type",
+        type=str,
+        default="focal",
+        choices=["ce", "focal"],
+        help="Training loss. 'focal' (default) down-weights the easy, dominant grain pixels so the "
+        "model stops collapsing to all-grain; 'ce' = plain cross-entropy.",
+    )
+    p.add_argument(
+        "--focal_gamma",
+        type=float,
+        default=2.0,
+        help="Focusing parameter for focal loss (only used when --loss_type=focal).",
+    )
+    p.add_argument(
+        "--auto_class_weights",
+        action="store_true",
+        help="Also weight the loss by inverse class frequency (estimated from the training fold). "
+        "Safe for the binary task since both classes are always present; stacks with focal.",
     )
     p.add_argument(
         "--fold",
@@ -363,12 +385,16 @@ def evaluate_binary_with_splits(
     device: torch.device,
     num_classes: int,
     ignore_index: int,
+    class_weights: torch.Tensor | None = None,
+    loss_type: str = "ce",
+    focal_gamma: float = 2.0,
 ) -> tuple[float, float, float, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Returns:
       val_loss, pixel_acc, mIoU, per_class_iou,
       gt_pixel_frac_per_class, pred_pixel_frac_per_class
     where the split vectors are normalized over valid (non-ignore) validation pixels.
+    val_loss uses the same loss (focal/weighting) as training so it's comparable.
     """
     model.eval()
     total, n = 0.0, 0
@@ -379,9 +405,10 @@ def evaluate_binary_with_splits(
         imgs = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        out = model(pixel_values=imgs, labels=labels)
-        loss = out.loss
-        logits = F.interpolate(out.logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+        out = model(pixel_values=imgs)
+        loss, logits = compute_seg_loss(
+            out, labels, class_weights, ignore_index, loss_type, focal_gamma
+        )
         preds = logits.argmax(dim=1)
 
         acc_sum += pixel_accuracy(preds, labels, ignore_index)
@@ -516,6 +543,15 @@ def run_single_fold(
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    # Optional inverse-frequency class weights (grain dominates ~80/20, so background is rare).
+    class_weights = None
+    if args.auto_class_weights:
+        class_weights = estimate_class_weights_from_dataset(
+            train_ds, NUM_BINARY_CLASSES, IGNORE_INDEX, device
+        )
+        print("[train] auto class weights:", class_weights.detach().cpu().numpy().round(3).tolist())
+    print(f"[train] loss_type={args.loss_type} focal_gamma={args.focal_gamma}")
+
     # ------------------------------------------------------------------
     # Weights & Biases setup (one run per fold, grouped under wandb_run_name).
     # ------------------------------------------------------------------
@@ -547,6 +583,9 @@ def run_single_fold(
                     "lr": args.lr,
                     "weight_decay": args.weight_decay,
                     "crop": args.crop,
+                    "loss_type": args.loss_type,
+                    "focal_gamma": args.focal_gamma,
+                    "auto_class_weights": args.auto_class_weights,
                     "n_folds": n_folds,
                     "fold": fold,
                     "cv_strategy": args.cv_strategy,
@@ -592,11 +631,20 @@ def run_single_fold(
             epoch,
             NUM_BINARY_CLASSES,
             IGNORE_INDEX,
-            None,
+            class_weights,
             scheduler=None,
+            loss_type=args.loss_type,
+            focal_gamma=args.focal_gamma,
         )
         va_loss, va_acc, va_miou, per_iou, gt_frac, pred_frac = evaluate_binary_with_splits(
-            model, val_loader, device, NUM_BINARY_CLASSES, IGNORE_INDEX
+            model,
+            val_loader,
+            device,
+            NUM_BINARY_CLASSES,
+            IGNORE_INDEX,
+            class_weights=class_weights,
+            loss_type=args.loss_type,
+            focal_gamma=args.focal_gamma,
         )
         # Match multiclass script: 3 d.p. for acc and mIoU; fold index in the epoch line for CV
         print(
