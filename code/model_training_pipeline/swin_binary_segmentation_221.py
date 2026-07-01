@@ -47,9 +47,12 @@ from swin_training_pipeline_221 import (
     NUM_CLASSES,
     build_class_presence_matrix,
     confusion_matrix,
+    group_members_by_stem,
+    grouped_kfold_indices,
     miou_from_confusion,
     pixel_accuracy,
     set_seed,
+    stratified_grouped_kfold_indices,
     stratified_kfold_indices,
     train_one_epoch,
 )
@@ -107,6 +110,20 @@ def parse_args() -> argparse.Namespace:
         help="How to build the K folds. 'stratified' = multi-label iterative stratification over "
         "the ORIGINAL multiclass class presence (so grain TYPES are spread evenly across folds, "
         "with scale bar/watermark ignored); 'random' = plain shuffled split (legacy).",
+    )
+    p.add_argument(
+        "--group_by_stem",
+        action="store_true",
+        help="Keep an image and its augmentations in the SAME fold (no CV leakage). Files are "
+        "grouped by source stem with --group_pattern stripped, so e.g. 00_TK-0.3 and "
+        "00_TK-0.3_aug03 are one group. Use this when training on a pre-augmented dataset.",
+    )
+    p.add_argument(
+        "--group_pattern",
+        type=str,
+        default=r"_aug\d+$",
+        help="Regex stripped from each file stem to derive its group key (default matches the "
+        "'_augNN' suffix written by the augmentation export). Only used with --group_by_stem.",
     )
     p.add_argument(
         "--fold",
@@ -708,18 +725,42 @@ def main() -> None:
         strict=True,
     )
     n = len(probe)
-    if n < args.n_folds:
+
+    # Optionally group an image and its augmentations so they never split across folds
+    # (avoids CV leakage when training on a pre-augmented dataset).
+    members: list[np.ndarray] | None = None
+    if args.group_by_stem:
+        members = group_members_by_stem(probe.pairs, args.group_pattern)
+        if len(members) < args.n_folds:
+            raise SystemExit(
+                f"Need at least {args.n_folds} groups for grouped {args.n_folds}-fold CV; "
+                f"found {len(members)} (from {n} images)."
+            )
+        print(
+            f"[cv] group_by_stem: {n} images -> {len(members)} source groups "
+            f"(pattern {args.group_pattern!r}); each family stays in one fold."
+        )
+    elif n < args.n_folds:
         raise SystemExit(f"Need at least {args.n_folds} samples for {args.n_folds}-fold CV; found {n}.")
 
+    grp = f" | grouped-by-stem ({len(members)} groups)" if members is not None else ""
     print(
         f"[config] Binary UPerNet+SwinV2 | {args.n_folds}-fold cross-validation | "
-        f"strategy={args.cv_strategy} | seed={args.seed} | drop_last_train=True"
+        f"strategy={args.cv_strategy} | seed={args.seed} | drop_last_train=True{grp}"
     )
 
     # Stratify over the ORIGINAL multiclass presence (grain types spread across folds),
     # ignoring scale bar + watermark so they don't drive the split.
+    presence: np.ndarray | None = None
     if args.cv_strategy == "stratified":
         presence = build_class_presence_matrix(probe.pairs, NUM_CLASSES, IGNORE_INDEX, ARTIFACT_CLASS_IDS)
+
+    if args.group_by_stem:
+        if args.cv_strategy == "stratified":
+            split_folds = stratified_grouped_kfold_indices(presence, members, args.n_folds, args.seed)
+        else:
+            split_folds = grouped_kfold_indices(members, args.n_folds, args.seed)
+    elif args.cv_strategy == "stratified":
         split_folds = stratified_kfold_indices(presence, args.n_folds, args.seed)
     else:
         split_folds = kfold_train_val_indices(n, args.n_folds, args.seed)
