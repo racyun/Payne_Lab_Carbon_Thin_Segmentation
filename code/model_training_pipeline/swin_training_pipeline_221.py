@@ -199,6 +199,15 @@ def parse_args() -> argparse.Namespace:
         "Takes precedence over --ignore_scale_bar.",
     )
     p.add_argument(
+        "--merge_class_map",
+        type=str,
+        default="",
+        help="Combine classes by remapping mask pixel values at load time. Comma-separated "
+        "'src:dst' pairs, e.g. '12:1' merges mollusk (12) into bivalves (1). NUM_CLASSES is "
+        "unchanged, so a merged source id becomes an unused (empty) class in the metrics. "
+        "Applied to both training masks and the stratification presence matrix.",
+    )
+    p.add_argument(
         "--class_weights",
         type=str,
         default=None,
@@ -280,6 +289,34 @@ def artifact_ignore_ids(args: argparse.Namespace) -> tuple[int, ...]:
     return ()
 
 
+def parse_merge_map(spec: str) -> dict[int, int]:
+    """Parse a '--merge_class_map' string ('12:1,15:8') into a {src: dst} dict.
+
+    Each src/dst must be a valid class id in [0, NUM_CLASSES) (dst may also be IGNORE_INDEX
+    to drop a class), and src != dst. Returns {} for an empty/None spec.
+    """
+    if not spec:
+        return {}
+    merge: dict[int, int] = {}
+    for pair in spec.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        try:
+            src_s, dst_s = pair.split(":")
+            src, dst = int(src_s), int(dst_s)
+        except ValueError as exc:
+            raise SystemExit(f"--merge_class_map: bad pair {pair!r}; expected 'src:dst'.") from exc
+        if not (0 <= src < NUM_CLASSES):
+            raise SystemExit(f"--merge_class_map: src {src} out of range [0, {NUM_CLASSES}).")
+        if not (0 <= dst < NUM_CLASSES or dst == IGNORE_INDEX):
+            raise SystemExit(f"--merge_class_map: dst {dst} must be in [0, {NUM_CLASSES}) or {IGNORE_INDEX}.")
+        if src == dst:
+            raise SystemExit(f"--merge_class_map: src == dst ({src}) is a no-op.")
+        merge[src] = dst
+    return merge
+
+
 def kfold_train_val_indices(n: int, n_folds: int, seed: int) -> list[tuple[np.ndarray, np.ndarray]]:
     """Return list of (train_idx, val_idx) for each fold; shuffled, stratification-free."""
     if n_folds < 2:
@@ -300,12 +337,13 @@ def build_class_presence_matrix(
     num_classes: int,
     ignore_index: int,
     ignore_class_ids: tuple[int, ...] = (),
+    merge_class_map: dict[int, int] | None = None,
 ) -> np.ndarray:
     """Binary [n_samples, num_classes] matrix: 1 where class c is present in image i's mask.
 
     Reads masks at full resolution (no crop transforms), so presence reflects the whole
-    image. Mirrors the artifact remapping in CarbonateSegmentationDataset.__getitem__ so a
-    class remapped to ignore_index is not counted as present.
+    image. Mirrors the artifact remapping AND the --merge_class_map remapping in
+    CarbonateSegmentationDataset.__getitem__ so folds stratify on the same (merged) labels.
     """
     n = len(pairs)
     presence = np.zeros((n, num_classes), dtype=np.uint8)
@@ -314,10 +352,12 @@ def build_class_presence_matrix(
         if mask.ndim == 3 and mask.shape[0] > 1:
             mask = mask[0:1, ...]
         mask = mask.squeeze(0).to(torch.long)
-        if ignore_class_ids:
+        if ignore_class_ids or merge_class_map:
             mask = mask.clone()
             for cid in ignore_class_ids:
                 mask[mask == cid] = ignore_index
+            for src, dst in (merge_class_map or {}).items():
+                mask[mask == src] = dst
         for v in torch.unique(mask).tolist():
             if 0 <= v < num_classes:
                 presence[i, v] = 1
@@ -565,12 +605,14 @@ class CarbonateSegmentationDataset(torch.utils.data.Dataset):
         ignore_class_ids: tuple[int, ...] = (),
         ignore_index: int = IGNORE_INDEX,
         print_pair_count: bool = True,
+        merge_class_map: dict[int, int] | None = None,
     ):
         self.root = Path(root)
         self.transforms = transforms
         self.normalize = normalize
         self.ignore_class_ids = tuple(ignore_class_ids)
         self.ignore_index = ignore_index
+        self.merge_class_map = dict(merge_class_map or {})
         self._print_pair_count = print_pair_count
 
         img_dir = Path(img_dir) if img_dir is not None else self.root / "img"
@@ -612,10 +654,13 @@ class CarbonateSegmentationDataset(torch.utils.data.Dataset):
 
         mask = mask.squeeze(0).to(torch.long)
 
-        if self.ignore_class_ids:
+        if self.ignore_class_ids or self.merge_class_map:
             mask = mask.clone()
             for cid in self.ignore_class_ids:
                 mask[mask == cid] = self.ignore_index
+            # Combine classes (e.g. mollusk 12 -> bivalves 1) by rewriting pixel values.
+            for src, dst in self.merge_class_map.items():
+                mask[mask == src] = dst
 
         # Defensive: any label outside the [0, NUM_CLASSES) scheme cannot be predicted by
         # the model's NUM_CLASSES logits and would crash the loss (CUDA assertion
@@ -1000,6 +1045,7 @@ def run_single_fold(
     tag = f"Fold {fold + 1}/{n_folds} | " if n_folds >= 2 else ""
 
     ignore_ids = artifact_ignore_ids(args)
+    merge_map = parse_merge_map(args.merge_class_map)
     crop = args.crop
     train_transforms = Compose(
         [
@@ -1027,6 +1073,7 @@ def run_single_fold(
         normalize=True,
         strict=False,
         ignore_class_ids=ignore_ids,
+        merge_class_map=merge_map,
         print_pair_count=False,
     )
     val_full = CarbonateSegmentationDataset(
@@ -1037,6 +1084,7 @@ def run_single_fold(
         normalize=True,
         strict=False,
         ignore_class_ids=ignore_ids,
+        merge_class_map=merge_map,
         print_pair_count=False,
     )
 
@@ -1142,6 +1190,7 @@ def run_single_fold(
                     "auto_class_weights": args.auto_class_weights,
                     "class_weights_path": args.class_weights,
                     "ignore_class_ids": list(ignore_ids),
+                    "merge_class_map": {str(k): v for k, v in merge_map.items()},
                     "crop": args.crop,
                     "n_folds": n_folds,
                     "fold": fold,
@@ -1339,6 +1388,13 @@ def main() -> None:
         names = ", ".join(f"{c}:{CLASS_NAMES[c]}" for c in ignore_ids if c < len(CLASS_NAMES))
         print(f"[config] Ignoring artifact classes (remapped to {IGNORE_INDEX}): {names}")
 
+    merge_map = parse_merge_map(args.merge_class_map)
+    if merge_map:
+        def _name(c):
+            return CLASS_NAMES[c] if 0 <= c < len(CLASS_NAMES) else str(c)
+        pairs_str = ", ".join(f"{s}:{_name(s)} -> {d}:{_name(d)}" for s, d in merge_map.items())
+        print(f"[config] Merging classes (remapped in masks + presence): {pairs_str}")
+
     probe = CarbonateSegmentationDataset(
         data_root,
         img_dir=img_dir if use_explicit_dirs else None,
@@ -1347,6 +1403,7 @@ def main() -> None:
         normalize=True,
         strict=True,
         ignore_class_ids=ignore_ids,
+        merge_class_map=merge_map,
     )
     n = len(probe)
 
@@ -1391,7 +1448,9 @@ def main() -> None:
 
     presence: np.ndarray | None = None
     if args.cv_strategy == "stratified":
-        presence = build_class_presence_matrix(probe.pairs, NUM_CLASSES, IGNORE_INDEX, ignore_ids)
+        presence = build_class_presence_matrix(
+            probe.pairs, NUM_CLASSES, IGNORE_INDEX, ignore_ids, merge_map
+        )
         report_class_fold_feasibility(presence, args.n_folds)
 
     if args.group_by_stem:
