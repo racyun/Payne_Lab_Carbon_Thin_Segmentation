@@ -279,6 +279,12 @@ def parse_args() -> argparse.Namespace:
         choices=["online", "offline", "disabled"],
         help="W&B mode (online uploads live; offline writes locally; disabled = no logging).",
     )
+    p.add_argument(
+        "--wandb_mean_only",
+        action="store_true",
+        help="Log ONLY the cross-fold-averaged W&B run (one curve per metric = mean over folds), "
+        "not the individual per-fold runs. The CV-mean run is always logged either way.",
+    )
     return p.parse_args()
 
 
@@ -1253,7 +1259,7 @@ def run_single_fold(
     # Weights & Biases setup (logged once, then per-epoch metrics below).
     # ------------------------------------------------------------------
     wandb_run = None
-    if args.wandb_project and args.wandb_mode != "disabled":
+    if args.wandb_project and args.wandb_mode != "disabled" and not args.wandb_mean_only:
         if not _WANDB_AVAILABLE:
             print("[wandb] wandb not installed; skipping logging. `pip install wandb` to enable.")
         else:
@@ -1307,6 +1313,8 @@ def run_single_fold(
     # In-memory history for end-of-run W&B composite chart + table.
     epoch_history: list[int] = []
     per_class_history: list[list[float]] = [[] for _ in range(NUM_CLASSES)]
+    # Per-epoch metric dicts (for the cross-fold CV-mean W&B run logged after all folds).
+    metric_history: list[dict] = []
 
     for epoch in range(1, args.epochs + 1):
         tr = train_one_epoch(
@@ -1347,22 +1355,22 @@ def run_single_fold(
             v = per_iou_cpu[i].item()
             per_class_history[i].append(float(v) if torch.isfinite(per_iou_cpu[i]).item() else float("nan"))
 
-        # ------- Weights & Biases per-epoch metrics -------
+        # ------- Per-epoch metrics (logged per-fold now; averaged across folds later) -------
+        epoch_metrics = {
+            "epoch": epoch,
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "train/loss": float(tr),
+            "val/loss": float(va_loss),
+            "val/pixel_acc": float(va_acc),
+            "val/mIoU": float(va_miou),
+        }
+        for i, name in enumerate(CLASS_NAMES[: per_iou.numel()]):
+            if torch.isfinite(per_iou[i]).item():
+                epoch_metrics[f"val_iou/{i:02d}_{name}"] = float(per_iou[i].item())
+        metric_history.append(epoch_metrics)
+
         if wandb_run is not None:
-            current_lr = optimizer.param_groups[0]["lr"]
-            log_payload = {
-                "epoch": epoch,
-                "lr": current_lr,
-                "train/loss": tr,
-                "val/loss": va_loss,
-                "val/pixel_acc": va_acc,
-                "val/mIoU": va_miou,
-            }
-            for i, name in enumerate(CLASS_NAMES[: per_iou.numel()]):
-                v = per_iou[i].item()
-                if torch.isfinite(per_iou[i]).item():
-                    log_payload[f"val_iou/{i:02d}_{name}"] = v
-            wandb_run.log(log_payload, step=epoch)
+            wandb_run.log(epoch_metrics, step=epoch)
 
         if va_miou > best_miou:
             best_miou = va_miou
@@ -1434,7 +1442,61 @@ def run_single_fold(
         "miou": float(best_miou),
         "pixel_acc": float(best_acc),
         "per_class_val_iou": per_iou_list,
+        "history": metric_history,
     }
+
+
+def log_cv_mean_wandb(args, fold_histories, config_extra=None) -> None:
+    """Log ONE W&B run whose curves are the per-epoch MEAN across CV folds.
+
+    ``fold_histories`` is a list over folds; each element is a list over epochs of dicts like
+    ``{"epoch": e, "val/mIoU": ..., "train/loss": ..., ...}``. Every numeric metric is averaged
+    across the folds that reached that epoch and logged to a single run named
+    ``<wandb_run_name>_cvmean`` — so each metric shows up as one averaged curve instead of one per
+    fold. No-op when W&B is disabled/unavailable. Metric-name agnostic, so it works for both the
+    multiclass and binary pipelines.
+    """
+    if not getattr(args, "wandb_project", None) or args.wandb_mode == "disabled":
+        return
+    if not _WANDB_AVAILABLE or not fold_histories:
+        return
+    from collections import defaultdict
+
+    import wandb as _wandb
+
+    per_epoch: dict[int, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for hist in fold_histories:
+        for row in hist or []:
+            e = int(row.get("epoch"))
+            for k, v in row.items():
+                if k == "epoch":
+                    continue
+                if isinstance(v, (int, float)) and v == v:  # skip None / NaN
+                    per_epoch[e][k].append(float(v))
+    if not per_epoch:
+        return
+
+    run_name = f"{args.wandb_run_name}_cvmean" if args.wandb_run_name else "cvmean"
+    run = _wandb.init(
+        project=args.wandb_project,
+        entity=getattr(args, "wandb_entity", None),
+        name=run_name,
+        mode=args.wandb_mode,
+        group=args.wandb_run_name or None,
+        reinit=True,
+        config={"stage": "cv_mean", "n_folds": args.n_folds, **(config_extra or {})},
+    )
+    for e in sorted(per_epoch):
+        payload = {"epoch": e}
+        for k, vals in per_epoch[e].items():
+            if vals:
+                payload[k] = sum(vals) / len(vals)
+        run.log(payload, step=e)
+    print(
+        f"[wandb] logged CV-mean run '{run.name}': each metric averaged across "
+        f"{len(fold_histories)} folds over {len(per_epoch)} epochs."
+    )
+    run.finish()
 
 
 def main() -> None:
@@ -1599,13 +1661,15 @@ def main() -> None:
     if args.no_train:
         return
 
+    histories = [r.get("history", []) for r in all_best]
+    all_best_summary = [{k: v for k, v in r.items() if k != "history"} for r in all_best]
     summary_path = out_dir / "cv_summary.json"
     miou_vals = [r["miou"] for r in all_best]
     acc_vals = [r["pixel_acc"] for r in all_best]
     summary = {
         "n_folds": args.n_folds,
         "folds_completed": folds_to_run,
-        "per_fold_best": all_best,
+        "per_fold_best": all_best_summary,
         "mean_best_miou": float(np.mean(miou_vals)) if miou_vals else None,
         "std_best_miou": float(np.std(miou_vals)) if miou_vals else None,
         "mean_best_pixel_acc": float(np.mean(acc_vals)) if acc_vals else None,
@@ -1616,6 +1680,9 @@ def main() -> None:
     print("\n=== Cross-validation summary ===")
     print(json.dumps(summary, indent=2))
     print(f"\nWrote {summary_path}")
+
+    # Single W&B run with each metric averaged across folds (one curve per metric).
+    log_cv_mean_wandb(args, histories)
 
 
 if __name__ == "__main__":
