@@ -45,16 +45,14 @@ from transformers import UperNetConfig, UperNetForSemanticSegmentation
 from swin_training_pipeline_221 import (
     ARTIFACT_CLASS_IDS,
     NUM_CLASSES,
+    augment_aware_kfold_indices,
     build_class_presence_matrix,
     compute_seg_loss,
     confusion_matrix,
     estimate_class_weights_from_dataset,
-    group_members_by_stem,
-    grouped_kfold_indices,
     miou_from_confusion,
     pixel_accuracy,
     set_seed,
-    stratified_grouped_kfold_indices,
     stratified_kfold_indices,
     train_one_epoch,
 )
@@ -116,9 +114,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--group_by_stem",
         action="store_true",
-        help="Keep an image and its augmentations in the SAME fold (no CV leakage). Files are "
-        "grouped by source stem with --group_pattern stripped, so e.g. 00_TK-0.3 and "
-        "00_TK-0.3_aug03 are one group. Use this when training on a pre-augmented dataset.",
+        help="Train on a pre-augmented dataset correctly: augmentations (files matching "
+        "--group_pattern, e.g. 00_TK-0.3_aug03) are TRAINING-ONLY. Folds are built over the "
+        "original images, each validation fold holds only clean originals, and an image's "
+        "augmentations follow it into training (augs of a val original are dropped). No leakage, "
+        "no evaluation on distorted images, and val sets match a no-aug run on the same originals.",
     )
     p.add_argument(
         "--group_pattern",
@@ -816,24 +816,14 @@ def main() -> None:
     )
     n = len(probe)
 
-    # Optionally group an image and its augmentations so they never split across folds
-    # (avoids CV leakage when training on a pre-augmented dataset).
-    members: list[np.ndarray] | None = None
-    if args.group_by_stem:
-        members = group_members_by_stem(probe.pairs, args.group_pattern)
-        if len(members) < args.n_folds:
-            raise SystemExit(
-                f"Need at least {args.n_folds} groups for grouped {args.n_folds}-fold CV; "
-                f"found {len(members)} (from {n} images)."
-            )
-        print(
-            f"[cv] group_by_stem: {n} images -> {len(members)} source groups "
-            f"(pattern {args.group_pattern!r}); each family stays in one fold."
-        )
-    elif n < args.n_folds:
+    # When training on a pre-augmented dataset, keep augmentations TRAINING-ONLY: fold over the
+    # original images, validate on clean originals, and route each image's augmentations into
+    # training (dropping augs whose source original is in validation). No leakage, and validation
+    # is never done on distorted images.
+    if not args.group_by_stem and n < args.n_folds:
         raise SystemExit(f"Need at least {args.n_folds} samples for {args.n_folds}-fold CV; found {n}.")
 
-    grp = f" | grouped-by-stem ({len(members)} groups)" if members is not None else ""
+    grp = " | augment-aware (val = clean originals only)" if args.group_by_stem else ""
     print(
         f"[config] Binary UPerNet+SwinV2 | {args.n_folds}-fold cross-validation | "
         f"strategy={args.cv_strategy} | seed={args.seed} | drop_last_train=True{grp}"
@@ -846,10 +836,14 @@ def main() -> None:
         presence = build_class_presence_matrix(probe.pairs, NUM_CLASSES, IGNORE_INDEX, ARTIFACT_CLASS_IDS)
 
     if args.group_by_stem:
-        if args.cv_strategy == "stratified":
-            split_folds = stratified_grouped_kfold_indices(presence, members, args.n_folds, args.seed)
-        else:
-            split_folds = grouped_kfold_indices(members, args.n_folds, args.seed)
+        split_folds = augment_aware_kfold_indices(
+            probe.pairs, args.group_pattern, presence, args.n_folds, args.seed
+        )
+        n_orig = sum(len(va) for _, va in split_folds)
+        print(
+            f"[cv] augment-aware split: {n} files -> {n_orig} originals (held out for validation); "
+            f"augmentations (pattern {args.group_pattern!r}) are TRAINING-ONLY and never in val."
+        )
     elif args.cv_strategy == "stratified":
         split_folds = stratified_kfold_indices(presence, args.n_folds, args.seed)
     else:

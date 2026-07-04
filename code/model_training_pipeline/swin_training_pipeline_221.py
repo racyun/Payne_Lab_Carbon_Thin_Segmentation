@@ -164,9 +164,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--group_by_stem",
         action="store_true",
-        help="Keep an image and its augmentations in the SAME fold (no CV leakage). Files are "
-        "grouped by source stem with --group_pattern stripped, so e.g. 00_TK-0.3 and "
-        "00_TK-0.3_aug03 are one group. Use this when training on a pre-augmented dataset.",
+        help="Train on a pre-augmented dataset correctly: augmentations (files matching "
+        "--group_pattern, e.g. 00_TK-0.3_aug03) are TRAINING-ONLY. Folds are built over the "
+        "original images, each validation fold holds only clean originals, and an image's "
+        "augmentations follow it into training (augs of a val original are dropped). No leakage, "
+        "no evaluation on distorted images, and val sets match a no-aug run on the same originals.",
     )
     p.add_argument(
         "--group_pattern",
@@ -511,6 +513,73 @@ def stratified_grouped_kfold_indices(
     for gi, mem in enumerate(members):
         gpres[gi] = (presence[mem].sum(axis=0) > 0).astype(presence.dtype)
     return _expand_group_splits(stratified_kfold_indices(gpres, n_folds, seed), members)
+
+
+def augment_aware_kfold_indices(
+    pairs: list[tuple[Path, Path]],
+    pattern: str,
+    presence: np.ndarray | None,
+    n_folds: int,
+    seed: int,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Fold split where augmentations are TRAINING-ONLY and every validation fold is clean originals.
+
+    Files whose stem matches ``pattern`` (default the ``_augNN`` suffix) are treated as augmented
+    copies of a source ORIGINAL. The K folds are built over the original images only — stratified
+    over ``presence`` when given, else random. For each fold:
+
+      - validation = the original images assigned to that fold (clean, un-augmented),
+      - training   = the remaining originals PLUS every augmentation whose source original is in
+        training.
+
+    Augmentations of a validation original are dropped entirely (never trained on, never
+    evaluated). This removes both CV leakage AND evaluation on distorted images, and — because the
+    split is computed over the originals only — a with-augmentation run and a no-augmentation run
+    on the same originals (same seed) get identical validation folds, so they are directly
+    comparable.
+    """
+    rx = re.compile(pattern)
+    orig_pos: list[int] = []
+    orig_stems: list[str] = []
+    aug_by_src: dict[str, list[int]] = {}
+    for i, (img_path, _) in enumerate(pairs):
+        stem = img_path.stem
+        if rx.search(stem):
+            aug_by_src.setdefault(rx.sub("", stem), []).append(i)
+        else:
+            orig_pos.append(i)
+            orig_stems.append(stem)
+    orig_pos_arr = np.asarray(orig_pos, dtype=np.int64)
+    if len(orig_pos_arr) < n_folds:
+        raise ValueError(
+            f"Need at least {n_folds} ORIGINAL (non-augmented) images for {n_folds}-fold CV; "
+            f"found {len(orig_pos_arr)} (pattern {pattern!r})."
+        )
+
+    # Fold assignment over ORIGINALS only (local indices 0..len(orig)-1).
+    if presence is not None:
+        orig_splits = stratified_kfold_indices(presence[orig_pos_arr], n_folds, seed)
+    else:
+        orig_splits = kfold_train_val_indices(len(orig_pos_arr), n_folds, seed)
+
+    all_local = np.arange(len(orig_pos_arr))
+    splits: list[tuple[np.ndarray, np.ndarray]] = []
+    for _, val_local in orig_splits:
+        val_local = np.asarray(val_local, dtype=np.int64)
+        val_stems = {orig_stems[p] for p in val_local.tolist()}
+        train_local = np.setdiff1d(all_local, val_local, assume_unique=False)
+        train_global = list(orig_pos_arr[train_local])
+        # Augs follow their source original into TRAIN; augs of a val original are dropped.
+        for src, aug_list in aug_by_src.items():
+            if src not in val_stems:
+                train_global.extend(aug_list)
+        splits.append(
+            (
+                np.sort(np.asarray(train_global, dtype=np.int64)),
+                np.sort(orig_pos_arr[val_local].astype(np.int64)),
+            )
+        )
+    return splits
 
 
 def set_seed(seed: int) -> None:
@@ -1429,21 +1498,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     # K-fold cross-validation (default: --n_folds 5).
     # ------------------------------------------------------------------
-    # Optionally group an image and its augmentations so they never split across folds
-    # (avoids CV leakage when training on a pre-augmented dataset).
-    members: list[np.ndarray] | None = None
-    if args.group_by_stem:
-        members = group_members_by_stem(probe.pairs, args.group_pattern)
-        if len(members) < args.n_folds:
-            raise SystemExit(
-                f"Need at least {args.n_folds} groups for grouped {args.n_folds}-fold CV; "
-                f"found {len(members)} (from {n} images)."
-            )
-        print(
-            f"[cv] group_by_stem: {n} images -> {len(members)} source groups "
-            f"(pattern {args.group_pattern!r}); each family stays in one fold."
-        )
-    elif n < args.n_folds:
+    # When training on a pre-augmented dataset, keep augmentations TRAINING-ONLY: fold over the
+    # original images, validate on clean originals, and route each image's augmentations into
+    # training (dropping augs whose source original is in validation). No leakage, and validation
+    # is never done on distorted images.
+    if not args.group_by_stem and n < args.n_folds:
         raise SystemExit(f"Need at least {args.n_folds} samples for {args.n_folds}-fold CV; found {n}.")
 
     presence: np.ndarray | None = None
@@ -1454,10 +1513,14 @@ def main() -> None:
         report_class_fold_feasibility(presence, args.n_folds)
 
     if args.group_by_stem:
-        if args.cv_strategy == "stratified":
-            splits = stratified_grouped_kfold_indices(presence, members, args.n_folds, args.seed)
-        else:
-            splits = grouped_kfold_indices(members, args.n_folds, args.seed)
+        splits = augment_aware_kfold_indices(
+            probe.pairs, args.group_pattern, presence, args.n_folds, args.seed
+        )
+        n_orig = sum(len(va) for _, va in splits)
+        print(
+            f"[cv] augment-aware split: {n} files -> {n_orig} originals (held out for validation); "
+            f"augmentations (pattern {args.group_pattern!r}) are TRAINING-ONLY and never in val."
+        )
     elif args.cv_strategy == "stratified":
         splits = stratified_kfold_indices(presence, args.n_folds, args.seed)
     else:
@@ -1477,7 +1540,7 @@ def main() -> None:
     else:
         folds_to_run = list(range(args.n_folds))
 
-    grp = f" | grouped-by-stem ({len(members)} groups)" if args.group_by_stem else ""
+    grp = " | augment-aware (val = clean originals only)" if args.group_by_stem else ""
     print(
         f"[config] Multiclass UPerNet+SwinV2 | {args.n_folds}-fold cross-validation | "
         f"strategy={args.cv_strategy} | seed={args.seed} | folds_to_run={folds_to_run} | n={n}{grp}"
