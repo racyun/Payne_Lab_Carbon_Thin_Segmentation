@@ -178,6 +178,14 @@ def parse_args() -> argparse.Namespace:
         "'_augNN' suffix written by the augmentation export). Only used with --group_by_stem.",
     )
     p.add_argument(
+        "--num_augmentations_per_img",
+        type=int,
+        default=None,
+        help="Cap how many augmentations of each original image are used for TRAINING (keeps the "
+        "lowest-numbered, e.g. 5 -> aug00..aug04). Default None = use all. Only used with "
+        "--group_by_stem; does not affect validation (which is always clean originals).",
+    )
+    p.add_argument(
         "--val_frac",
         type=float,
         default=0.2,
@@ -521,6 +529,7 @@ def augment_aware_kfold_indices(
     presence: np.ndarray | None,
     n_folds: int,
     seed: int,
+    max_augs_per_source: int | None = None,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Fold split where augmentations are TRAINING-ONLY and every validation fold is clean originals.
 
@@ -537,18 +546,34 @@ def augment_aware_kfold_indices(
     split is computed over the originals only — a with-augmentation run and a no-augmentation run
     on the same originals (same seed) get identical validation folds, so they are directly
     comparable.
+
+    ``max_augs_per_source`` caps how many augmentations of each original are used for training:
+    the lowest-numbered ``_augNN`` are kept (e.g. 5 -> aug00..aug04), the rest ignored. ``None``
+    uses all available. Validation is unaffected (it never contains augmentations), so changing
+    this does not change the val sets.
     """
     rx = re.compile(pattern)
+    digit_rx = re.compile(r"\d+")
     orig_pos: list[int] = []
     orig_stems: list[str] = []
-    aug_by_src: dict[str, list[int]] = {}
+    aug_by_src: dict[str, list[tuple[int, int]]] = {}  # src -> [(aug_index, global_index)]
     for i, (img_path, _) in enumerate(pairs):
         stem = img_path.stem
-        if rx.search(stem):
-            aug_by_src.setdefault(rx.sub("", stem), []).append(i)
+        m = rx.search(stem)
+        if m:
+            src = rx.sub("", stem)
+            dm = digit_rx.search(m.group(0))
+            aug_index = int(dm.group()) if dm else 0
+            aug_by_src.setdefault(src, []).append((aug_index, i))
         else:
             orig_pos.append(i)
             orig_stems.append(stem)
+    # Keep the lowest-numbered augmentations per original (cap), then reduce to plain index lists.
+    for src, items in aug_by_src.items():
+        ordered = sorted(items)  # by aug_index
+        if max_augs_per_source is not None:
+            ordered = ordered[:max_augs_per_source]
+        aug_by_src[src] = [gi for _, gi in ordered]
     orig_pos_arr = np.asarray(orig_pos, dtype=np.int64)
     if len(orig_pos_arr) < n_folds:
         raise ValueError(
@@ -1514,12 +1539,18 @@ def main() -> None:
 
     if args.group_by_stem:
         splits = augment_aware_kfold_indices(
-            probe.pairs, args.group_pattern, presence, args.n_folds, args.seed
+            probe.pairs, args.group_pattern, presence, args.n_folds, args.seed,
+            max_augs_per_source=args.num_augmentations_per_img,
         )
         n_orig = sum(len(va) for _, va in splits)
+        cap = (
+            f"; capped to {args.num_augmentations_per_img} augs/original"
+            if args.num_augmentations_per_img is not None
+            else ""
+        )
         print(
             f"[cv] augment-aware split: {n} files -> {n_orig} originals (held out for validation); "
-            f"augmentations (pattern {args.group_pattern!r}) are TRAINING-ONLY and never in val."
+            f"augmentations (pattern {args.group_pattern!r}) are TRAINING-ONLY and never in val{cap}."
         )
     elif args.cv_strategy == "stratified":
         splits = stratified_kfold_indices(presence, args.n_folds, args.seed)

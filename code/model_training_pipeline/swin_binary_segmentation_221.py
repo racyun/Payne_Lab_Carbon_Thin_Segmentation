@@ -128,6 +128,14 @@ def parse_args() -> argparse.Namespace:
         "'_augNN' suffix written by the augmentation export). Only used with --group_by_stem.",
     )
     p.add_argument(
+        "--num_augmentations_per_img",
+        type=int,
+        default=None,
+        help="Cap how many augmentations of each original image are used for TRAINING (keeps the "
+        "lowest-numbered, e.g. 5 -> aug00..aug04). Default None = use all. Only used with "
+        "--group_by_stem; does not affect validation (which is always clean originals).",
+    )
+    p.add_argument(
         "--loss_type",
         type=str,
         default="focal",
@@ -837,12 +845,18 @@ def main() -> None:
 
     if args.group_by_stem:
         split_folds = augment_aware_kfold_indices(
-            probe.pairs, args.group_pattern, presence, args.n_folds, args.seed
+            probe.pairs, args.group_pattern, presence, args.n_folds, args.seed,
+            max_augs_per_source=args.num_augmentations_per_img,
         )
         n_orig = sum(len(va) for _, va in split_folds)
+        cap = (
+            f"; capped to {args.num_augmentations_per_img} augs/original"
+            if args.num_augmentations_per_img is not None
+            else ""
+        )
         print(
             f"[cv] augment-aware split: {n} files -> {n_orig} originals (held out for validation); "
-            f"augmentations (pattern {args.group_pattern!r}) are TRAINING-ONLY and never in val."
+            f"augmentations (pattern {args.group_pattern!r}) are TRAINING-ONLY and never in val{cap}."
         )
     elif args.cv_strategy == "stratified":
         split_folds = stratified_kfold_indices(presence, args.n_folds, args.seed)
