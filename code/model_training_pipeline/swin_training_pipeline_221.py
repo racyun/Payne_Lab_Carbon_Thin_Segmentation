@@ -1486,15 +1486,42 @@ def log_cv_mean_wandb(args, fold_histories, config_extra=None) -> None:
         reinit=True,
         config={"stage": "cv_mean", "n_folds": args.n_folds, **(config_extra or {})},
     )
-    for e in sorted(per_epoch):
+    epochs_sorted = sorted(per_epoch)
+    for e in epochs_sorted:
         payload = {"epoch": e}
         for k, vals in per_epoch[e].items():
             if vals:
                 payload[k] = sum(vals) / len(vals)
         run.log(payload, step=e)
+
+    # Composite per-class IoU chart + table (mean across folds) so every class shows on one panel.
+    iou_keys = sorted({k for ep in per_epoch.values() for k in ep if k.startswith("val_iou/")})
+    if iou_keys:
+        labels = [k[len("val_iou/"):] for k in iou_keys]
+        ys = [
+            [(sum(v) / len(v) if (v := per_epoch[e].get(k)) else None) for e in epochs_sorted]
+            for k in iou_keys
+        ]
+        try:
+            run.log({
+                "val_iou/per_class_lines": _wandb.plot.line_series(
+                    xs=epochs_sorted, ys=ys, keys=labels,
+                    title="Per-class validation IoU (mean across folds)", xname="epoch",
+                )
+            })
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            print(f"[wandb] per-class line chart skipped: {exc}")
+        try:
+            tbl = _wandb.Table(columns=["epoch"] + labels)
+            for idx, e in enumerate(epochs_sorted):
+                tbl.add_data(e, *[ys[c][idx] for c in range(len(iou_keys))])
+            run.log({"val_iou/per_class_table": tbl})
+        except Exception as exc:  # noqa: BLE001
+            print(f"[wandb] per-class table skipped: {exc}")
+
     print(
-        f"[wandb] logged CV-mean run '{run.name}': each metric averaged across "
-        f"{len(fold_histories)} folds over {len(per_epoch)} epochs."
+        f"[wandb] logged CV-mean run '{run.name}': each metric (incl. {len(iou_keys)} per-class "
+        f"IoUs) averaged across {len(fold_histories)} folds over {len(per_epoch)} epochs."
     )
     run.finish()
 
