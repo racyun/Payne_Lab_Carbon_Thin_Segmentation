@@ -58,6 +58,7 @@ from swin_training_pipeline_221 import (
     log_cv_mean_wandb,
     miou_from_confusion,
     parse_merge_map,
+    report_class_fold_feasibility,
     set_seed,
     stratified_kfold_indices,
     CarbonateSegmentationDataset,
@@ -300,6 +301,9 @@ def run_single_fold(fold, n_folds, train_idx, val_idx, cfg, args, device):
               f"acc {va_acc:.3f} | mIoU {va_miou:.3f}")
 
         ious = [float(per_iou[i]) if torch.isfinite(per_iou[i]).item() else float("nan") for i in range(num_classes)]
+        print(f"  per-class val IoU (epoch {epoch:02d}):")
+        for i, nm in enumerate(class_names[:num_classes]):
+            print(f"    {i:02d} {nm}: " + (f"{ious[i]:.4f}" if ious[i] == ious[i] else "nan"))
         with metrics_csv.open("a", encoding="utf-8") as f:
             f.write(f"{epoch},{tr:.6f},{va_loss:.6f},{va_acc:.6f},{va_miou:.6f}," +
                     ",".join(f"{v:.6f}" if v == v else "nan" for v in ious) + "\n")
@@ -375,6 +379,7 @@ def main() -> None:
         p_ignore = ignore_ids if args.task == "multiclass" else ARTIFACT_CLASS_IDS
         presence = build_class_presence_matrix(probe.pairs, NUM_CLASSES, IGNORE_INDEX, p_ignore,
                                                merge_map if args.task == "multiclass" else None)
+        report_class_fold_feasibility(presence, args.n_folds)
 
     if args.group_by_stem:
         splits = augment_aware_kfold_indices(probe.pairs, args.group_pattern, presence,
