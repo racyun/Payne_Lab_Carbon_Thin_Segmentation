@@ -1224,8 +1224,16 @@ def run_single_fold(
         print("[train] Using auto-estimated class weights:", class_weights.detach().cpu().numpy().round(3).tolist())
 
     model = get_model_semantic_segmentation(NUM_CLASSES, IGNORE_INDEX, BACKBONE_ID)
+    pretraining = "carbonate_ssl" if args.backbone_checkpoint else "imagenet"
     if args.backbone_checkpoint:
         load_ssl_backbone_checkpoint(model, args.backbone_checkpoint)
+    else:
+        print("[model] No --backbone_checkpoint given: Swin backbone stays ImageNet-pretrained "
+              "(use_pretrained_backbone=True) -> this is the 'Swin+ImageNet' variant.")
+    n_total = sum(p.numel() for p in model.parameters())
+    n_bb = sum(p.numel() for p in model.backbone.parameters())
+    print(f"[model] backbone={BACKBONE_ID} | pretraining={pretraining} | "
+          f"total params={n_total/1e6:.2f}M (backbone {n_bb/1e6:.2f}M)")
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -1297,6 +1305,7 @@ def run_single_fold(
                     "val_frac": args.val_frac,
                     "seed": args.seed,
                     "ssl_backbone_checkpoint": args.backbone_checkpoint,
+                    "pretraining": "carbonate_ssl" if args.backbone_checkpoint else "imagenet",
                 },
             )
             print(f"[wandb] logging to project={args.wandb_project} run={wandb_run.name}")
