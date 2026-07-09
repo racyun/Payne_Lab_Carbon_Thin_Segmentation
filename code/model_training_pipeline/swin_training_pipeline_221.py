@@ -252,6 +252,20 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional SSL checkpoint path; loads checkpoint['backbone_state'] into model.backbone.",
     )
+    p.add_argument(
+        "--backbone_id",
+        type=str,
+        default=BACKBONE_ID,
+        help="HF backbone id for the UPerNet encoder. Default is SwinV2-Tiny (STRATA / Swin+ImageNet). "
+             "Use 'microsoft/resnet-50' for the ResNet+ImageNet controlled variant.",
+    )
+    p.add_argument(
+        "--backbone_out_indices",
+        type=str,
+        default="0,1,2,3",
+        help="Comma-separated backbone feature-stage indices fed to UPerNet. Swin uses 0,1,2,3; "
+             "ResNet-50 needs 1,2,3,4 (its four residual stages). Verify with the smoke test.",
+    )
     p.add_argument("--no_viz", action="store_true", help="Skip matplotlib overlay at end of training.")
     # Weights & Biases logging.
     p.add_argument(
@@ -625,11 +639,14 @@ def get_model_semantic_segmentation(
     num_classes: int,
     ignore_index: int = IGNORE_INDEX,
     backbone_id: str = BACKBONE_ID,
+    out_indices: list[int] | None = None,
 ) -> UperNetForSemanticSegmentation:
+    if out_indices is None:
+        out_indices = [0, 1, 2, 3]
     cfg = UperNetConfig(
         backbone=backbone_id,
         use_pretrained_backbone=True,
-        backbone_kwargs={"out_indices": [0, 1, 2, 3]},
+        backbone_kwargs={"out_indices": [int(i) for i in out_indices]},
         num_labels=num_classes,
         loss_ignore_index=ignore_index,
         use_auxiliary_head=False,
@@ -1223,17 +1240,18 @@ def run_single_fold(
         class_weights = estimate_class_weights_from_dataset(train_ds, NUM_CLASSES, IGNORE_INDEX, device)
         print("[train] Using auto-estimated class weights:", class_weights.detach().cpu().numpy().round(3).tolist())
 
-    model = get_model_semantic_segmentation(NUM_CLASSES, IGNORE_INDEX, BACKBONE_ID)
+    backbone_out_indices = [int(x) for x in args.backbone_out_indices.split(",") if x.strip() != ""]
+    model = get_model_semantic_segmentation(NUM_CLASSES, IGNORE_INDEX, args.backbone_id, backbone_out_indices)
     pretraining = "carbonate_ssl" if args.backbone_checkpoint else "imagenet"
     if args.backbone_checkpoint:
         load_ssl_backbone_checkpoint(model, args.backbone_checkpoint)
     else:
-        print("[model] No --backbone_checkpoint given: Swin backbone stays ImageNet-pretrained "
-              "(use_pretrained_backbone=True) -> this is the 'Swin+ImageNet' variant.")
+        print(f"[model] No --backbone_checkpoint given: {args.backbone_id} backbone stays "
+              "ImageNet-pretrained (use_pretrained_backbone=True).")
     n_total = sum(p.numel() for p in model.parameters())
     n_bb = sum(p.numel() for p in model.backbone.parameters())
-    print(f"[model] backbone={BACKBONE_ID} | pretraining={pretraining} | "
-          f"total params={n_total/1e6:.2f}M (backbone {n_bb/1e6:.2f}M)")
+    print(f"[model] backbone={args.backbone_id} | out_indices={backbone_out_indices} | "
+          f"pretraining={pretraining} | total params={n_total/1e6:.2f}M (backbone {n_bb/1e6:.2f}M)")
     model = model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -1285,7 +1303,7 @@ def run_single_fold(
                 reinit=True,
                 config={
                     "stage": "finetune",
-                    "backbone_id": BACKBONE_ID,
+                    "backbone_id": args.backbone_id,
                     "num_classes": NUM_CLASSES,
                     "epochs": args.epochs,
                     "batch_size": args.batch_size,
@@ -1391,7 +1409,7 @@ def run_single_fold(
                     "model_state": model.state_dict(),
                     "num_classes": NUM_CLASSES,
                     "ignore_index": IGNORE_INDEX,
-                    "backbone_id": BACKBONE_ID,
+                    "backbone_id": args.backbone_id,
                     "fold": fold,
                     "n_folds": n_folds,
                     "per_class_val_iou": per_iou.cpu(),
