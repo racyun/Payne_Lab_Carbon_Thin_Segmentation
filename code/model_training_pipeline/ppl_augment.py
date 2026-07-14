@@ -198,3 +198,70 @@ def augment(img, mask, cfg=DEFAULT_AUG, return_ops=False):
     if return_ops:
         return img, mask, applied
     return img, mask
+
+
+# ---------------------------------------------------------------------------
+# Ablation support: build a config with exactly ONE augmentation active.
+# ---------------------------------------------------------------------------
+COLOR_JITTER_PRESETS = {
+    "light":       dict(brightness=0.10, contrast=0.10, saturation=0.15, hue=0.03),
+    "medium":      dict(brightness=0.20, contrast=0.20, saturation=0.25, hue=0.05),
+    "strong":      dict(brightness=0.30, contrast=0.30, saturation=0.40, hue=0.08),
+    "very_strong": dict(brightness=0.40, contrast=0.40, saturation=0.55, hue=0.10),
+}
+
+
+def single_aug_cfg(aug_type: str, level=None, frac: float = 0.2, crop: int = 512) -> dict:
+    """Build an ``augment()`` config with exactly ONE augmentation active (for ablations).
+
+    Every augmentation probability is zeroed except ``aug_type``. The crop always runs; unless
+    ``aug_type='rare_crop'`` it is a plain random crop (rare_crop_prob=0). ``level`` sets the
+    chosen augmentation's magnitude (interpreted per type), ``frac`` is the probability a training
+    sample receives it. ``aug_type='none'`` = crop only (the no-augmentation baseline).
+
+    level by type: affine=degrees, rgb_shift=max shift, clahe=clip, gamma=half-width,
+    blur=max sigma, noise=sigma, color_jitter=preset name, rare_crop=probability;
+    ignored for hflip/vflip/grayscale/none.
+    """
+    cfg = dict(DEFAULT_AUG)
+    cfg.update(
+        crop=crop, rare_crop_prob=0.0,
+        hflip_p=0.0, vflip_p=0.0, affine_p=0.0, color_jitter_p=0.0,
+        rgbshift_p=0.0, clahe_p=0.0, gamma_p=0.0, blur_p=0.0, noise_p=0.0, grayscale_p=0.0,
+    )
+    t = aug_type
+    if t == "none":
+        return cfg
+    if t == "rare_crop":
+        cfg["rare_crop_prob"] = float(level) if level is not None else 0.5  # applies to all crops
+    elif t == "affine":
+        cfg["affine_p"] = frac
+        cfg["affine_deg"] = float(level) if level is not None else 15.0
+    elif t == "hflip":
+        cfg["hflip_p"] = frac
+    elif t == "vflip":
+        cfg["vflip_p"] = frac
+    elif t == "color_jitter":
+        cfg["color_jitter_p"] = frac
+        cfg.update(COLOR_JITTER_PRESETS[str(level)])
+    elif t == "rgb_shift":
+        cfg["rgbshift_p"] = frac
+        cfg["rgbshift_max"] = int(float(level))
+    elif t == "clahe":
+        cfg["clahe_p"] = frac
+        cfg["clahe_clip"] = float(level)
+    elif t == "gamma":
+        cfg["gamma_p"] = frac
+        w = float(level)
+        cfg["gamma_range"] = (max(0.05, 1.0 - w), 1.0 + w)
+    elif t == "blur":
+        cfg["blur_p"] = frac
+        cfg["blur_sigma"] = (0.1, float(level))
+    elif t == "noise":
+        cfg["noise_p"] = frac
+        cfg["noise_sigma"] = float(level)
+    elif t == "grayscale":
+        cfg["grayscale_p"] = frac
+    else:
+        raise ValueError(f"single_aug_cfg: unknown aug_type {aug_type!r}")
+    return cfg

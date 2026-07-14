@@ -186,6 +186,32 @@ def parse_args() -> argparse.Namespace:
         "--group_by_stem; does not affect validation (which is always clean originals).",
     )
     p.add_argument(
+        "--ablation_aug",
+        type=str,
+        default=None,
+        choices=["none", "rare_crop", "affine", "hflip", "vflip", "color_jitter",
+                 "rgb_shift", "clahe", "gamma", "blur", "noise", "grayscale"],
+        help="On-the-fly single-augmentation ABLATION mode: train on the ORIGINAL images and apply "
+        "ONLY this augmentation to --aug_frac of training crops; validation stays clean. "
+        "'none' = crop-only baseline. When unset, the normal (offline/pre-baked) path is used. "
+        "Do NOT combine with --group_by_stem (use plain ALL_LABELS originals).",
+    )
+    p.add_argument(
+        "--aug_level",
+        type=str,
+        default=None,
+        help="Magnitude for --ablation_aug (per type): affine=degrees, rgb_shift=max, clahe=clip, "
+        "gamma=half-width, blur=max sigma, noise=sigma, color_jitter=preset "
+        "(light|medium|strong|very_strong), rare_crop=probability. Ignored for hflip/vflip/grayscale/none.",
+    )
+    p.add_argument(
+        "--aug_frac",
+        type=float,
+        default=0.2,
+        help="Fraction of training samples that receive the ablation augmentation (default 0.2). "
+        "Not used for rare_crop, which applies to all crops via --aug_level.",
+    )
+    p.add_argument(
         "--val_frac",
         type=float,
         default=0.2,
@@ -723,6 +749,7 @@ class CarbonateSegmentationDataset(torch.utils.data.Dataset):
         ignore_index: int = IGNORE_INDEX,
         print_pair_count: bool = True,
         merge_class_map: dict[int, int] | None = None,
+        ablation_cfg: dict | None = None,
     ):
         self.root = Path(root)
         self.transforms = transforms
@@ -731,6 +758,9 @@ class CarbonateSegmentationDataset(torch.utils.data.Dataset):
         self.ignore_index = ignore_index
         self.merge_class_map = dict(merge_class_map or {})
         self._print_pair_count = print_pair_count
+        # When set, apply this single on-the-fly augmentation (via ppl_augment.augment) instead of
+        # self.transforms — used by the ablation study. Includes the crop, so transforms is skipped.
+        self.ablation_cfg = ablation_cfg
 
         img_dir = Path(img_dir) if img_dir is not None else self.root / "img"
         mask_dir = Path(mask_dir) if mask_dir is not None else self.root / "masks"
@@ -788,11 +818,23 @@ class CarbonateSegmentationDataset(torch.utils.data.Dataset):
         if bool(oob.any()):
             mask[oob] = self.ignore_index
 
-        img = tv_tensors.Image(img)
-        sem_mask = tv_tensors.Mask(mask)
+        if self.ablation_cfg is not None:
+            # On-the-fly single-augmentation path (ablation): augment() does crop + the one aug.
+            from ppl_augment import augment as _ablation_augment
 
-        if self.transforms is not None:
-            img, sem_mask = self.transforms(img, sem_mask)
+            im = img
+            if im.shape[0] == 1:
+                im = im.repeat(3, 1, 1)
+            elif im.shape[0] == 4:
+                im = im[:3]
+            aug_img, aug_mask = _ablation_augment(im.to(torch.uint8), mask, cfg=self.ablation_cfg)
+            img = tv_tensors.Image(aug_img)
+            sem_mask = tv_tensors.Mask(aug_mask)
+        else:
+            img = tv_tensors.Image(img)
+            sem_mask = tv_tensors.Mask(mask)
+            if self.transforms is not None:
+                img, sem_mask = self.transforms(img, sem_mask)
 
         img_f = V2F.convert_image_dtype(img, dtype=torch.float32)
         if img_f.shape[0] == 1:
@@ -1182,16 +1224,28 @@ def run_single_fold(
     # does not crash on sub-crop images; padded mask borders default to class 0.
     val_transforms = Compose([CenterCrop((crop, crop))])
 
+    # Ablation mode: apply ONE augmentation on-the-fly to training crops (val stays clean).
+    ablation_cfg = None
+    if args.ablation_aug is not None:
+        from ppl_augment import single_aug_cfg
+
+        ablation_cfg = single_aug_cfg(args.ablation_aug, args.aug_level, args.aug_frac, crop)
+        print(
+            f"[ablation] fold {fold}: on-the-fly single aug type={args.ablation_aug} "
+            f"level={args.aug_level} frac={args.aug_frac} (training crops only; validation clean)"
+        )
+
     train_full = CarbonateSegmentationDataset(
         data_root,
         img_dir=img_dir if use_explicit_dirs else None,
         mask_dir=mask_dir if use_explicit_dirs else None,
-        transforms=train_transforms,
+        transforms=None if ablation_cfg is not None else train_transforms,
         normalize=True,
         strict=False,
         ignore_class_ids=ignore_ids,
         merge_class_map=merge_map,
         print_pair_count=False,
+        ablation_cfg=ablation_cfg,
     )
     val_full = CarbonateSegmentationDataset(
         data_root,
@@ -1317,6 +1371,9 @@ def run_single_fold(
                     "class_weights_path": args.class_weights,
                     "ignore_class_ids": list(ignore_ids),
                     "merge_class_map": {str(k): v for k, v in merge_map.items()},
+                    "ablation_aug": args.ablation_aug,
+                    "aug_level": args.aug_level,
+                    "aug_frac": args.aug_frac,
                     "crop": args.crop,
                     "n_folds": n_folds,
                     "fold": fold,
@@ -1736,7 +1793,9 @@ def main() -> None:
     print(f"\nWrote {summary_path}")
 
     # Single W&B run with each metric averaged across folds (one curve per metric).
-    log_cv_mean_wandb(args, histories)
+    log_cv_mean_wandb(args, histories, config_extra={
+        "ablation_aug": args.ablation_aug, "aug_level": args.aug_level, "aug_frac": args.aug_frac,
+    })
 
 
 if __name__ == "__main__":
