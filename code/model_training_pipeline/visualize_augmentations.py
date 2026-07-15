@@ -64,14 +64,15 @@ def load_base(img_path: Path, mask_path: Path, crop: int = 512):
         nh, nw = int(H * scale) + 1, int(W * scale) + 1
         img = TF.resize(img, [nh, nw], antialias=True).to(torch.uint8)
         mask = TF.resize(mask.unsqueeze(0), [nh, nw], interpolation=InterpolationMode.NEAREST).squeeze(0)
-    img = TF.center_crop(img, [crop, crop])
-    mask = TF.center_crop(mask.unsqueeze(0), [crop, crop]).squeeze(0)
-    return img, mask
+    full_img, full_mask = img, mask  # keep the larger image so rare_crop has room to move
+    img_c = TF.center_crop(img, [crop, crop])
+    mask_c = TF.center_crop(mask.unsqueeze(0), [crop, crop]).squeeze(0)
+    return img_c, mask_c, full_img, full_mask
 
 
-def apply_one(img_u8: torch.Tensor, mask_long: torch.Tensor, aug_type: str, level):
-    """Apply exactly one augmentation to a fixed crop (so only the aug differs from the original)."""
-    cfg = P.single_aug_cfg(aug_type, level, frac=1.0, crop=int(img_u8.shape[-1]))
+def apply_one(img_u8: torch.Tensor, mask_long: torch.Tensor, aug_type: str, level, crop: int = 512):
+    """Apply exactly one augmentation. For rare_crop, pass the FULL image so it can pick a window."""
+    cfg = P.single_aug_cfg(aug_type, level, frac=1.0, crop=crop)
     img = img_u8.clone()
     mask_c = mask_long.clone().unsqueeze(0)
     if aug_type == "rare_crop":
@@ -130,18 +131,20 @@ def main():
         raise SystemExit(f"No mask for {img_path.name} at {mask_path}")
     print(f"Using image: {img_path.name}")
 
-    base_img, base_mask = load_base(img_path, mask_path, args.crop)
+    base_img, base_mask, full_img, full_mask = load_base(img_path, mask_path, args.crop)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
     for fam, levels in FAMILIES.items():
         nrows = len(levels)
         fig, axes = plt.subplots(nrows, 3, figsize=(9, 3 * nrows), squeeze=False)
+        # rare_crop must see the FULL image (it chooses a 512 window); others use the fixed crop.
+        src_img, src_mask = (full_img, full_mask) if fam == "rare_crop" else (base_img, base_mask)
         for r, level in enumerate(levels):
             title = fam if level is None else f"{fam} = {level}"
             panels = [("original", base_img),
-                      ("example 1", apply_one(base_img, base_mask, fam, level)),
-                      ("example 2", apply_one(base_img, base_mask, fam, level))]
+                      ("example 1", apply_one(src_img, src_mask, fam, level, args.crop)),
+                      ("example 2", apply_one(src_img, src_mask, fam, level, args.crop))]
             for c, (lbl, im) in enumerate(panels):
                 ax = axes[r][c]
                 ax.imshow(chw_to_hwc(im))
