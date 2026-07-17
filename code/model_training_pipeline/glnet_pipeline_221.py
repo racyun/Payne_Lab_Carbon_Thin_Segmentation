@@ -17,6 +17,10 @@ Evaluation (--eval_mode):
     argmaxed, and scored against the full mask. Global features are encoded once per image.
   - 'center': single center crop + global (fast; for quick smoke runs).
 
+At the end of each fold (unless --no_viz) it saves --viz_samples 4-panel figures
+(Original | Ground Truth Mask | Prediction | Overlay) under fold_N/prediction_viz/, using the
+whole-image tiled prediction of the best-mIoU model (same look as the single-path pipeline).
+
 Run (smoke): python code/model_training_pipeline/glnet_pipeline_221.py --img_dir ... --mask_dir ... --no_train
 """
 from __future__ import annotations
@@ -30,6 +34,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from PIL import Image
 from torch.utils.data import DataLoader, Subset
 from torchvision.io import read_image
 from torchvision.transforms.v2 import functional as TF
@@ -51,6 +56,7 @@ from swin_training_pipeline_221 import (
     artifact_ignore_ids,
     augment_aware_kfold_indices,
     build_class_presence_matrix,
+    colorize_mask,
     confusion_matrix,
     focal_cross_entropy,
     kfold_train_val_indices,
@@ -230,48 +236,53 @@ def _tile_positions(size: int, crop: int, stride: int):
 
 
 @torch.no_grad()
+def _tiled_logits(model, global_img, full_u8, device, crop, stride, tile_batch):
+    """Encode the global image ONCE, predict every full-res tile reusing those features, and return
+    the averaged full-image logits [C, H, W] on CPU (overlapping tiles are logit-averaged)."""
+    _, H, W = full_u8.shape
+    g_feats = model.encode_global(global_img.unsqueeze(0).to(device))
+    tops, lefts = _tile_positions(H, crop, stride), _tile_positions(W, crop, stride)
+    num_classes = model.num_classes
+    logit_sum = torch.zeros(num_classes, H, W, dtype=torch.float32)  # CPU accumulator
+    count = torch.zeros(H, W, dtype=torch.float32)
+    locals_, bboxes, positions = [], [], []
+
+    def _flush():
+        if not locals_:
+            return
+        loc = torch.stack(locals_).to(device)
+        bb = torch.stack(bboxes).to(device)
+        logits = model.forward_local(g_feats, loc, bb).float().cpu()
+        for k, (t, l) in enumerate(positions):
+            logit_sum[:, t:t + crop, l:l + crop] += logits[k]
+            count[t:t + crop, l:l + crop] += 1.0
+        locals_.clear()
+        bboxes.clear()
+        positions.clear()
+
+    for t in tops:
+        for l in lefts:
+            locals_.append(_normalize(TF.crop(full_u8, t, l, crop, crop)))
+            bboxes.append(torch.tensor([l / W, t / H, (l + crop) / W, (t + crop) / H],
+                                       dtype=torch.float32))
+            positions.append((t, l))
+            if len(locals_) >= tile_batch:
+                _flush()
+    _flush()
+    return logit_sum / count.clamp(min=1).unsqueeze(0)  # [C, H, W]
+
+
+@torch.no_grad()
 def evaluate_tiled(model, dataset, indices, device, num_classes, crop, stride, tile_batch,
                    loss_type, focal_gamma):
     """Faithful WHOLE-IMAGE eval: tile each val image into full-res crops, predict each with the
-    shared downsampled global image, average overlapping logits, argmax, and score the full mask.
-    Global features are encoded ONCE per image and reused across all its tiles."""
+    shared downsampled global image, average overlapping logits, argmax, and score the full mask."""
     model.eval()
     cm = torch.zeros(num_classes, num_classes, dtype=torch.float64)
     total_loss, n = 0.0, 0
     for idx in tqdm(indices, desc="tiled-eval", leave=False):
         global_img, full_u8, full_mask = dataset.full_sample(idx)
-        _, H, W = full_u8.shape
-        g_feats = model.encode_global(global_img.unsqueeze(0).to(device))
-        tops, lefts = _tile_positions(H, crop, stride), _tile_positions(W, crop, stride)
-
-        logit_sum = torch.zeros(num_classes, H, W, dtype=torch.float32)  # CPU accumulator
-        count = torch.zeros(H, W, dtype=torch.float32)
-        locals_, bboxes, positions = [], [], []
-
-        def _flush():
-            if not locals_:
-                return
-            loc = torch.stack(locals_).to(device)
-            bb = torch.stack(bboxes).to(device)
-            logits = model.forward_local(g_feats, loc, bb).float().cpu()
-            for k, (t, l) in enumerate(positions):
-                logit_sum[:, t:t + crop, l:l + crop] += logits[k]
-                count[t:t + crop, l:l + crop] += 1.0
-            locals_.clear()
-            bboxes.clear()
-            positions.clear()
-
-        for t in tops:
-            for l in lefts:
-                locals_.append(_normalize(TF.crop(full_u8, t, l, crop, crop)))
-                bboxes.append(torch.tensor([l / W, t / H, (l + crop) / W, (t + crop) / H],
-                                           dtype=torch.float32))
-                positions.append((t, l))
-                if len(locals_) >= tile_batch:
-                    _flush()
-        _flush()
-
-        avg = logit_sum / count.clamp(min=1).unsqueeze(0)  # [C, H, W]
+        avg = _tiled_logits(model, global_img, full_u8, device, crop, stride, tile_batch)
         pred = avg.argmax(0)
         cm += confusion_matrix(pred, full_mask, num_classes, IGNORE_INDEX).double()
         total_loss += float(_loss(avg.unsqueeze(0), full_mask.unsqueeze(0), None, loss_type, focal_gamma).item())
@@ -279,6 +290,44 @@ def evaluate_tiled(model, dataset, indices, device, num_classes, crop, stride, t
     miou, per_iou = miou_from_confusion(cm)
     pixel_acc = (cm.diag().sum() / cm.sum().clamp(min=1)).item()
     return total_loss / max(1, n), pixel_acc, miou, per_iou.cpu()
+
+
+@torch.no_grad()
+def render_predictions_glnet(model, dataset, indices, device, crop, stride, tile_batch,
+                             viz_dir: Path, n_viz: int):
+    """Save 4-panel figures (Original | Ground Truth Mask | Prediction | Overlay) for the first
+    n_viz val items, matching the single-path pipeline's look. Predictions are the whole-image
+    tiled output, so the panels show the real full-image segmentation."""
+    model.eval()
+    viz_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[viz] matplotlib not installed; skipping GLNet panels.")
+        return
+    n = min(n_viz, len(indices))
+    for i in range(n):
+        global_img, full_u8, full_mask = dataset.full_sample(indices[i])
+        avg = _tiled_logits(model, global_img, full_u8, device, crop, stride, tile_batch)
+        pred_np = avg.argmax(0).numpy().astype(np.uint8)
+        gt_np = full_mask.numpy().astype(np.uint8)
+        orig = full_u8.permute(1, 2, 0).numpy().astype(np.uint8)
+        pred_color = np.array(colorize_mask(pred_np))
+        gt_color = np.array(colorize_mask(gt_np))
+        overlay = (0.55 * pred_color + 0.45 * orig).astype(np.uint8)
+
+        Image.fromarray(pred_color).save(viz_dir / f"prediction_{i:02d}.png")
+        plt.figure(figsize=(20, 6))
+        for j, (title, im) in enumerate([("Original", orig), ("Ground Truth Mask", gt_color),
+                                         ("Prediction", pred_color), ("Overlay", overlay)]):
+            plt.subplot(1, 4, j + 1)
+            plt.title(title)
+            plt.imshow(im)
+            plt.axis("off")
+        plt.tight_layout()
+        plt.savefig(viz_dir / f"panel_{i:02d}.png", dpi=150)
+        plt.close()
+    print(f"[viz] Saved {n} GLNet 4-panel figures under {viz_dir}")
 
 
 def build_scheduler(optimizer, args):
@@ -330,6 +379,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval_stride", type=int, default=None,
                    help="Tile stride for tiled eval (default = --local_crop, i.e. non-overlapping).")
     p.add_argument("--eval_tile_batch", type=int, default=4, help="Tiles predicted per batch during tiled eval.")
+    p.add_argument("--viz_samples", type=int, default=8,
+                   help="Number of val images to save as 4-panel prediction figures per fold.")
+    p.add_argument("--no_viz", action="store_true", help="Skip saving prediction panels at end of each fold.")
     p.add_argument("--fold", type=int, default=None)
     p.add_argument("--no_train", action="store_true", help="Build model + one dummy forward, report memory, exit.")
     p.add_argument("--max_steps_per_epoch", type=int, default=None)
@@ -435,6 +487,12 @@ def run_single_fold(fold, n_folds, train_idx, val_idx, cfg, args, device):
             if wandb_run is not None:
                 wandb_run.summary["best_val_mIoU"] = best_miou
                 wandb_run.summary["best_epoch"] = epoch
+
+    if not args.no_viz:
+        best_ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(best_ckpt["model_state"])  # panels reflect the best-mIoU model
+        render_predictions_glnet(model, val_full, val_idx, device, args.local_crop, eval_stride,
+                                 args.eval_tile_batch, fold_dir / "prediction_viz", args.viz_samples)
 
     if wandb_run is not None:
         wandb_run.finish()
