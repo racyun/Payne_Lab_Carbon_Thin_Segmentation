@@ -305,6 +305,8 @@ def parse_args() -> argparse.Namespace:
              "ResNet-50 needs 1,2,3,4 (its four residual stages). Verify with the smoke test.",
     )
     p.add_argument("--no_viz", action="store_true", help="Skip matplotlib overlay at end of training.")
+    p.add_argument("--viz_only", action="store_true",
+                   help="Load each fold's saved checkpoint and re-render prediction panels only (no training).")
     # Weights & Biases logging.
     p.add_argument(
         "--wandb_project",
@@ -1123,7 +1125,9 @@ def render_predictions(model, val_ds, device, crop: int, args, viz_dir: Path) ->
             for i in range(n_viz):
                 img, gt_mask = val_ds[i]
                 h, w = img.shape[-2:]
-                if h > crop or w > crop:
+                # --resize_full models are trained on the WHOLE frame, so predict it in one pass
+                # (tiling a whole-image model produces grid seams). Only tile the 512-crop models.
+                if args.resize_full is None and (h > crop or w > crop):
                     pred = predict_image_tiled(
                         model,
                         img.unsqueeze(0),
@@ -1330,6 +1334,18 @@ def run_single_fold(
     print(f"[model] backbone={args.backbone_id} | out_indices={backbone_out_indices} | "
           f"pretraining={pretraining} | total params={n_total/1e6:.2f}M (backbone {n_bb/1e6:.2f}M)")
     model = model.to(device)
+
+    if args.viz_only:
+        # Re-render prediction panels from an existing checkpoint (no training).
+        ckpt_path = fold_dir / "best_upernet_swinv2.pth"
+        if not ckpt_path.exists():
+            raise SystemExit(f"--viz_only: no checkpoint at {ckpt_path}")
+        state = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(state["model_state"])
+        print(f"[viz_only] loaded {ckpt_path}; rendering {args.viz_samples} panels")
+        render_predictions(model, val_ds, device, crop, args, fold_dir / "prediction_viz")
+        return {"fold": fold, "status": "viz_only"}
+
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # Build the main scheduler (post-warmup), then optionally chain a linear-warmup
@@ -1790,10 +1806,10 @@ def main() -> None:
             device,
             on_gpu,
         )
-        if result.get("status") != "no_train":
+        if result.get("status") not in ("no_train", "viz_only"):
             all_best.append(result)
 
-    if args.no_train:
+    if args.no_train or args.viz_only:
         return
 
     histories = [r.get("history", []) for r in all_best]
