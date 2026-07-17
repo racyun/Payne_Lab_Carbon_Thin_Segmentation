@@ -39,7 +39,18 @@ from PIL import Image
 from torch.utils.data import DataLoader, Subset
 from torchvision import tv_tensors
 from torchvision.io import read_image
-from torchvision.transforms.v2 import CenterCrop, Compose, RandomCrop, RandomHorizontalFlip, RandomVerticalFlip, Resize
+from torchvision.transforms.v2 import (
+    CenterCrop,
+    ColorJitter,
+    Compose,
+    RandomApply,
+    RandomCrop,
+    RandomGrayscale,
+    RandomHorizontalFlip,
+    RandomRotation,
+    RandomVerticalFlip,
+    Resize,
+)
 from torchvision.transforms.v2 import functional as V2F
 from tqdm.auto import tqdm
 
@@ -307,6 +318,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_viz", action="store_true", help="Skip matplotlib overlay at end of training.")
     p.add_argument("--viz_only", action="store_true",
                    help="Load each fold's saved checkpoint and re-render prediction panels only (no training).")
+    p.add_argument("--overfit_n", type=int, default=None,
+                   help="Diagnostic: train AND evaluate on the same first N images (no augmentation). "
+                        "Train mIoU should climb toward ~1.0 if optimization is healthy; if it can't "
+                        "memorize a handful of images, there is a real bug, not a data problem.")
+    p.add_argument("--aug_strong", action="store_true",
+                   help="With --resize_full: add geometric (rotation) + photometric (color jitter, "
+                        "occasional grayscale) augmentation on top of flips. Recommended for the tiny "
+                        "dataset to fight overfitting and the stain-color shortcut.")
     # Weights & Biases logging.
     p.add_argument(
         "--wandb_project",
@@ -808,6 +827,12 @@ class CarbonateSegmentationDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int):
         img_path, mask_path = self.pairs[idx]
         img = read_image(str(img_path))
+        # Normalize channel count up front (3ch) so photometric transforms (ColorJitter,
+        # grayscale) work on the grayscale-PPL images too. The later repeat becomes a no-op.
+        if img.shape[0] == 1:
+            img = img.repeat(3, 1, 1)
+        elif img.shape[0] == 4:
+            img = img[:3]
         mask = read_image(str(mask_path))
 
         if mask.ndim == 3 and mask.shape[0] > 1:
@@ -1230,7 +1255,22 @@ def run_single_fold(
         # model sees full grains (no chopping). v2 Resize uses bilinear for the image and
         # nearest for the tv_tensors.Mask automatically. Train adds flips; val is a plain resize.
         rh, rw = int(args.resize_full[0]), int(args.resize_full[1])
-        train_transforms = Compose([RandomHorizontalFlip(p=0.5), RandomVerticalFlip(p=0.2), Resize((rh, rw))])
+        if args.aug_strong:
+            # Richer whole-image augmentation: geometric (flips + small rotation) to multiply the
+            # tiny dataset, and photometric (brightness/contrast/saturation jitter + occasional
+            # grayscale) to break the stain-color shortcut (color images -> one class, grayscale ->
+            # another). NOTE: stain color can be petrographically diagnostic; drop RandomGrayscale
+            # if that matters for your classes.
+            train_transforms = Compose([
+                RandomHorizontalFlip(p=0.5),
+                RandomVerticalFlip(p=0.5),
+                RandomApply([RandomRotation(degrees=15, fill={tv_tensors.Mask: IGNORE_INDEX, "others": 0})], p=0.5),
+                RandomApply([ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2)], p=0.7),
+                RandomGrayscale(p=0.2),
+                Resize((rh, rw)),
+            ])
+        else:
+            train_transforms = Compose([RandomHorizontalFlip(p=0.5), RandomVerticalFlip(p=0.2), Resize((rh, rw))])
         val_transforms = Compose([Resize((rh, rw))])
     else:
         train_transforms = Compose(
@@ -1250,6 +1290,11 @@ def run_single_fold(
         # CenterCrop already pads (with 0) when an image is smaller than the crop, so it
         # does not crash on sub-crop images; padded mask borders default to class 0.
         val_transforms = Compose([CenterCrop((crop, crop))])
+
+    if args.overfit_n:
+        # Pure memorization test: train on the SAME deterministic inputs we evaluate on
+        # (no random flips/crops), so failure to reach ~1.0 train mIoU indicates a real bug.
+        train_transforms = val_transforms
 
     # Ablation mode: apply ONE augmentation on-the-fly to training crops (val stays clean).
     ablation_cfg = None
@@ -1718,6 +1763,15 @@ def main() -> None:
     device = torch.device("cuda" if on_gpu else "cpu")
 
     use_kfold = args.n_folds is not None and args.n_folds >= 2
+
+    if args.overfit_n:
+        k = min(args.overfit_n, n)
+        idx = list(range(k))
+        print(f"[overfit] Sanity test: train AND eval on the SAME first {k} image(s) for "
+              f"{args.epochs} epochs, no augmentation. The reported val mIoU IS the train mIoU here — "
+              f"it should climb toward ~1.0. If it plateaus low, the problem is a bug, not the data.")
+        run_single_fold(0, 1, idx, idx, data_root, img_dir, mask_dir, use_explicit_dirs, args, device, on_gpu)
+        return
 
     # ------------------------------------------------------------------
     # Single train/val split (legacy path: --n_folds 1).
