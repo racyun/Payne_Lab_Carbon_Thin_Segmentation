@@ -39,7 +39,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Subset
 from torchvision import tv_tensors
 from torchvision.io import read_image
-from torchvision.transforms.v2 import CenterCrop, Compose, RandomCrop, RandomHorizontalFlip, RandomVerticalFlip
+from torchvision.transforms.v2 import CenterCrop, Compose, RandomCrop, RandomHorizontalFlip, RandomVerticalFlip, Resize
 from torchvision.transforms.v2 import functional as V2F
 from tqdm.auto import tqdm
 
@@ -137,6 +137,16 @@ def parse_args() -> argparse.Namespace:
         help="Focusing parameter for focal loss (only used when --loss_type=focal).",
     )
     p.add_argument("--crop", type=int, default=512, help="Train random crop and val center crop size.")
+    p.add_argument(
+        "--resize_full",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("H", "W"),
+        help="Whole-image mode: resize the ENTIRE image to H W (e.g. 1536 1920) instead of cropping, "
+        "so the model sees full grains. Overrides --crop for train/val transforms. Must be multiples "
+        "of 32. Memory-heavy at high resolution -- use a small --batch_size and ideally an A100.",
+    )
     p.add_argument(
         "--n_folds",
         type=int,
@@ -1206,23 +1216,31 @@ def run_single_fold(
     ignore_ids = artifact_ignore_ids(args)
     merge_map = parse_merge_map(args.merge_class_map)
     crop = args.crop
-    train_transforms = Compose(
-        [
-            RandomHorizontalFlip(p=0.5),
-            RandomVerticalFlip(p=0.2),
-            # pad_if_needed: some labeled images (e.g. in ALL_LABELS) are smaller than
-            # `crop` in a dimension; pad up to the crop size, filling the mask with
-            # ignore_index so padded borders are not learned as a real class.
-            RandomCrop(
-                (crop, crop),
-                pad_if_needed=True,
-                fill={tv_tensors.Mask: IGNORE_INDEX, "others": 0},
-            ),
-        ]
-    )
-    # CenterCrop already pads (with 0) when an image is smaller than the crop, so it
-    # does not crash on sub-crop images; padded mask borders default to class 0.
-    val_transforms = Compose([CenterCrop((crop, crop))])
+    if args.resize_full is not None:
+        # Whole-image mode: resize the ENTIRE image to (H, W) instead of cropping, so the
+        # model sees full grains (no chopping). v2 Resize uses bilinear for the image and
+        # nearest for the tv_tensors.Mask automatically. Train adds flips; val is a plain resize.
+        rh, rw = int(args.resize_full[0]), int(args.resize_full[1])
+        train_transforms = Compose([RandomHorizontalFlip(p=0.5), RandomVerticalFlip(p=0.2), Resize((rh, rw))])
+        val_transforms = Compose([Resize((rh, rw))])
+    else:
+        train_transforms = Compose(
+            [
+                RandomHorizontalFlip(p=0.5),
+                RandomVerticalFlip(p=0.2),
+                # pad_if_needed: some labeled images (e.g. in ALL_LABELS) are smaller than
+                # `crop` in a dimension; pad up to the crop size, filling the mask with
+                # ignore_index so padded borders are not learned as a real class.
+                RandomCrop(
+                    (crop, crop),
+                    pad_if_needed=True,
+                    fill={tv_tensors.Mask: IGNORE_INDEX, "others": 0},
+                ),
+            ]
+        )
+        # CenterCrop already pads (with 0) when an image is smaller than the crop, so it
+        # does not crash on sub-crop images; padded mask borders default to class 0.
+        val_transforms = Compose([CenterCrop((crop, crop))])
 
     # Ablation mode: apply ONE augmentation on-the-fly to training crops (val stays clean).
     ablation_cfg = None
