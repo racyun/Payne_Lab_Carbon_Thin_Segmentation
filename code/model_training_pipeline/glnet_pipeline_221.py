@@ -304,7 +304,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--backbone_id", type=str, default=BACKBONE_ID)
     p.add_argument("--backbone_checkpoint", type=str, default=None, help="SSL backbone checkpoint.")
     p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--batch_size", type=int, default=2,
+                   help="Train batch size. Must be >=2: UPerNet's PSP head has BatchNorm that "
+                        "fails on a 1x1-pooled batch of 1.")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=1337)
@@ -344,6 +346,8 @@ def run_single_fold(fold, n_folds, train_idx, val_idx, cfg, args, device):
     global_hw = (args.global_h, args.global_w)
     common = dict(img_dir=args.img_dir, mask_dir=args.mask_dir, global_hw=global_hw,
                   local_crop=args.local_crop, ignore_ids=ignore_ids, merge_map=merge_map)
+    if args.batch_size < 2:
+        raise SystemExit("--batch_size must be >=2 (UPerNet's PSP-head BatchNorm fails on a batch of 1).")
     train_full = GlnetDataset(train=True, **common)
     val_full = GlnetDataset(train=False, **common)
     train_ds, val_ds = Subset(train_full, train_idx), Subset(val_full, val_idx)
@@ -368,7 +372,7 @@ def run_single_fold(fold, n_folds, train_idx, val_idx, cfg, args, device):
         load_ssl_backbone_checkpoint(model, args.backbone_checkpoint)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = build_scheduler(optimizer, args)
-    scaler = torch.cuda.amp.GradScaler() if (args.amp and on_gpu) else None
+    scaler = torch.amp.GradScaler("cuda") if (args.amp and on_gpu) else None
     eval_stride = args.eval_stride if args.eval_stride else args.local_crop
     print(f"[train] global={global_hw} local={args.local_crop} loss={args.loss_type} amp={bool(scaler)} "
           f"eval={args.eval_mode}" + (f" (stride {eval_stride}, tile_batch {args.eval_tile_batch})"

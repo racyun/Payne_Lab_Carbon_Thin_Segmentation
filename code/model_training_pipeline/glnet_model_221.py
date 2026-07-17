@@ -120,9 +120,10 @@ if __name__ == "__main__":
     print(f"params: {n_params/1e6:.1f}M | fuse stages: {[m.in_channels for m in model.fuse]}")
 
     gh, gw, crop = 1024, 1280, 512
-    global_img = torch.randn(1, 3, gh, gw, device=dev)
-    local_crop = torch.randn(1, 3, crop, crop, device=dev)
-    bbox = torch.tensor([[0.25, 0.25, 0.25 + crop / gw, 0.25 + crop / gh]], device=dev)  # normalized
+    bs = 2  # UPerNet's PSP head has BatchNorm; batch>=2 required in train mode (1x1-pooled branch).
+    global_img = torch.randn(bs, 3, gh, gw, device=dev)
+    local_crop = torch.randn(bs, 3, crop, crop, device=dev)
+    bbox = torch.tensor([[0.25, 0.25, 0.25 + crop / gw, 0.25 + crop / gh]] * bs, device=dev)  # normalized
 
     if dev.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -130,8 +131,8 @@ if __name__ == "__main__":
     logits = model(global_img, local_crop, bbox)
     loss = logits.float().mean()
     loss.backward()  # exercise the backward path (memory realism)
-    print(f"logits: {tuple(logits.shape)}  (expected [1, {NUM_CLASSES}, {crop}, {crop}])")
+    print(f"logits: {tuple(logits.shape)}  (expected [{bs}, {NUM_CLASSES}, {crop}, {crop}])")
     if dev.type == "cuda":
         print(f"peak GPU memory: {torch.cuda.max_memory_allocated()/1e9:.2f} GB "
-              f"(global {gh}x{gw} + crop {crop}x{crop}, batch 1, with backward)")
+              f"(global {gh}x{gw} + crop {crop}x{crop}, batch {bs}, with backward)")
     print("smoke test OK")

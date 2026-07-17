@@ -231,6 +231,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--output_dir", type=str, default=".", help="Directory for checkpoints and viz.")
     p.add_argument("--no_train", action="store_true", help="Only build data loaders and exit (smoke test).")
+    p.add_argument("--max_steps_per_epoch", type=int, default=None,
+                   help="Cap training steps per epoch (smoke tests). Default: full epoch.")
     p.add_argument(
         "--ignore_scale_bar",
         action="store_true",
@@ -957,11 +959,14 @@ def train_one_epoch(
     scheduler=None,
     loss_type: str = "ce",
     focal_gamma: float = 2.0,
+    max_steps: int | None = None,
 ) -> float:
     model.train()
     total, n = 0.0, 0
     pbar = tqdm(loader, desc=f"epoch {epoch:02d}", leave=False)
-    for imgs, labels in pbar:
+    for step, (imgs, labels) in enumerate(pbar):
+        if max_steps is not None and step >= max_steps:
+            break
         imgs = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
@@ -1431,6 +1436,7 @@ def run_single_fold(
             scheduler,
             loss_type=args.loss_type,
             focal_gamma=args.focal_gamma,
+            max_steps=args.max_steps_per_epoch,
         )
         va_loss, va_acc, va_miou, per_iou = evaluate(
             model,
