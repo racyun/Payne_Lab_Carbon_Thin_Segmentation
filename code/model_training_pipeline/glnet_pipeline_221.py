@@ -11,8 +11,11 @@ confusion-matrix mIoU / per-class IoU, cross-fold-mean W&B logging, seed, and th
 mask handling. Same flags (--n_folds, --merge_class_map, --ignore_artifacts, --loss_type,
 --wandb_mean_only, --backbone_checkpoint, ...) plus --global_h/--global_w, --local_crop, --amp.
 
-Phase-1 evaluation uses a single CENTER crop (fast, validates the model end-to-end). Tiled
-whole-image evaluation is a planned follow-up.
+Evaluation (--eval_mode):
+  - 'tiled' (default): faithful WHOLE-IMAGE metric. Each val image is tiled into full-res crops;
+    each is predicted with the shared downsampled global image; overlapping logits are averaged,
+    argmaxed, and scored against the full mask. Global features are encoded once per image.
+  - 'center': single center crop + global (fast; for quick smoke runs).
 
 Run (smoke): python code/model_training_pipeline/glnet_pipeline_221.py --img_dir ... --mask_dir ... --no_train
 """
@@ -145,6 +148,20 @@ class GlnetDataset(torch.utils.data.Dataset):
         bbox = torch.tensor([left / W, top / H, (left + c) / W, (top + c) / H], dtype=torch.float32)
         return global_img, local, bbox, local_mask
 
+    def full_sample(self, idx):
+        """For tiled whole-image eval: returns (global_img_norm[1,3,gh,gw-shaped],
+        full_img_uint8[3,H,W], full_mask_long[H,W]) with the SAME pad/merge/ignore handling."""
+        img, mask = self._load(idx)
+        c = self.crop
+        _, H, W = img.shape
+        if H < c or W < c:
+            ph, pw = max(0, c - H), max(0, c - W)
+            img = F.pad(img, (0, pw, 0, ph), value=0)
+            mask = F.pad(mask.unsqueeze(0), (0, pw, 0, ph), value=IGNORE_INDEX).squeeze(0)
+        gh, gw = self.global_hw
+        global_img = _normalize(TF.resize(img, [gh, gw], antialias=True))
+        return global_img, img, mask
+
 
 # ---------------------------------------------------------------------------
 # Train / eval
@@ -202,6 +219,68 @@ def evaluate(model, loader, device, num_classes, class_weights, loss_type, focal
     return total / max(1, n), pixel_acc, miou, per_iou.cpu()
 
 
+def _tile_positions(size: int, crop: int, stride: int):
+    """Top-left offsets covering [0, size); the last tile is clamped to the edge (small overlap)."""
+    if size <= crop:
+        return [0]
+    pos = list(range(0, size - crop + 1, stride))
+    if pos[-1] != size - crop:
+        pos.append(size - crop)
+    return pos
+
+
+@torch.no_grad()
+def evaluate_tiled(model, dataset, indices, device, num_classes, crop, stride, tile_batch,
+                   loss_type, focal_gamma):
+    """Faithful WHOLE-IMAGE eval: tile each val image into full-res crops, predict each with the
+    shared downsampled global image, average overlapping logits, argmax, and score the full mask.
+    Global features are encoded ONCE per image and reused across all its tiles."""
+    model.eval()
+    cm = torch.zeros(num_classes, num_classes, dtype=torch.float64)
+    total_loss, n = 0.0, 0
+    for idx in tqdm(indices, desc="tiled-eval", leave=False):
+        global_img, full_u8, full_mask = dataset.full_sample(idx)
+        _, H, W = full_u8.shape
+        g_feats = model.encode_global(global_img.unsqueeze(0).to(device))
+        tops, lefts = _tile_positions(H, crop, stride), _tile_positions(W, crop, stride)
+
+        logit_sum = torch.zeros(num_classes, H, W, dtype=torch.float32)  # CPU accumulator
+        count = torch.zeros(H, W, dtype=torch.float32)
+        locals_, bboxes, positions = [], [], []
+
+        def _flush():
+            if not locals_:
+                return
+            loc = torch.stack(locals_).to(device)
+            bb = torch.stack(bboxes).to(device)
+            logits = model.forward_local(g_feats, loc, bb).float().cpu()
+            for k, (t, l) in enumerate(positions):
+                logit_sum[:, t:t + crop, l:l + crop] += logits[k]
+                count[t:t + crop, l:l + crop] += 1.0
+            locals_.clear()
+            bboxes.clear()
+            positions.clear()
+
+        for t in tops:
+            for l in lefts:
+                locals_.append(_normalize(TF.crop(full_u8, t, l, crop, crop)))
+                bboxes.append(torch.tensor([l / W, t / H, (l + crop) / W, (t + crop) / H],
+                                           dtype=torch.float32))
+                positions.append((t, l))
+                if len(locals_) >= tile_batch:
+                    _flush()
+        _flush()
+
+        avg = logit_sum / count.clamp(min=1).unsqueeze(0)  # [C, H, W]
+        pred = avg.argmax(0)
+        cm += confusion_matrix(pred, full_mask, num_classes, IGNORE_INDEX).double()
+        total_loss += float(_loss(avg.unsqueeze(0), full_mask.unsqueeze(0), None, loss_type, focal_gamma).item())
+        n += 1
+    miou, per_iou = miou_from_confusion(cm)
+    pixel_acc = (cm.diag().sum() / cm.sum().clamp(min=1)).item()
+    return total_loss / max(1, n), pixel_acc, miou, per_iou.cpu()
+
+
 def build_scheduler(optimizer, args):
     if args.scheduler == "none" and args.warmup_epochs <= 0:
         return None
@@ -244,6 +323,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup_epochs", type=int, default=5)
     p.add_argument("--scheduler", type=str, default="cosine", choices=["none", "cosine"])
     p.add_argument("--amp", action="store_true", help="Mixed precision (recommended at high resolution).")
+    p.add_argument("--eval_mode", type=str, default="tiled", choices=["tiled", "center"],
+                   help="'tiled' = faithful whole-image eval (tile+stitch); 'center' = single center crop (fast).")
+    p.add_argument("--eval_stride", type=int, default=None,
+                   help="Tile stride for tiled eval (default = --local_crop, i.e. non-overlapping).")
+    p.add_argument("--eval_tile_batch", type=int, default=4, help="Tiles predicted per batch during tiled eval.")
     p.add_argument("--fold", type=int, default=None)
     p.add_argument("--no_train", action="store_true", help="Build model + one dummy forward, report memory, exit.")
     p.add_argument("--max_steps_per_epoch", type=int, default=None)
@@ -285,7 +369,10 @@ def run_single_fold(fold, n_folds, train_idx, val_idx, cfg, args, device):
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = build_scheduler(optimizer, args)
     scaler = torch.cuda.amp.GradScaler() if (args.amp and on_gpu) else None
-    print(f"[train] global={global_hw} local={args.local_crop} loss={args.loss_type} amp={bool(scaler)}")
+    eval_stride = args.eval_stride if args.eval_stride else args.local_crop
+    print(f"[train] global={global_hw} local={args.local_crop} loss={args.loss_type} amp={bool(scaler)} "
+          f"eval={args.eval_mode}" + (f" (stride {eval_stride}, tile_batch {args.eval_tile_batch})"
+                                       if args.eval_mode == "tiled" else ""))
 
     wandb_run = None
     if args.wandb_project and args.wandb_mode != "disabled" and not args.wandb_mean_only:
@@ -311,8 +398,13 @@ def run_single_fold(fold, n_folds, train_idx, val_idx, cfg, args, device):
     for epoch in range(1, args.epochs + 1):
         tr = train_one_epoch(model, train_loader, optimizer, device, epoch, None, args.loss_type,
                              args.focal_gamma, scheduler, scaler, args.max_steps_per_epoch)
-        va_loss, va_acc, va_miou, per_iou = evaluate(model, val_loader, device, NUM_CLASSES, None,
-                                                     args.loss_type, args.focal_gamma)
+        if args.eval_mode == "tiled":
+            va_loss, va_acc, va_miou, per_iou = evaluate_tiled(
+                model, val_full, val_idx, device, NUM_CLASSES, args.local_crop, eval_stride,
+                args.eval_tile_batch, args.loss_type, args.focal_gamma)
+        else:
+            va_loss, va_acc, va_miou, per_iou = evaluate(model, val_loader, device, NUM_CLASSES, None,
+                                                         args.loss_type, args.focal_gamma)
         print(f"Fold {fold} | Epoch {epoch:02d} | train {tr:.4f} | val {va_loss:.4f} | "
               f"acc {va_acc:.3f} | mIoU {va_miou:.3f}")
         ious = [float(per_iou[i]) if torch.isfinite(per_iou[i]).item() else float("nan") for i in range(NUM_CLASSES)]

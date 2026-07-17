@@ -74,6 +74,37 @@ class GlobalLocalUperNet(nn.Module):
         logits = F.interpolate(logits, size=local_crop.shape[-2:], mode="bilinear", align_corners=False)
         return logits
 
+    # --- Tiled-eval helpers: encode ONE global image once, reuse for a batch of tiles. ---
+    def encode_global(self, global_img: torch.Tensor):
+        """global_img: [1,3,H,W] -> tuple of 4 global feature maps (batch 1)."""
+        return self.backbone(pixel_values=global_img).feature_maps
+
+    @staticmethod
+    def _global_region_shared(gf: torch.Tensor, bbox_norm: torch.Tensor, out_hw) -> torch.Tensor:
+        """gf: [1,C,H,W] (one global); bbox_norm: [b,4] -> [b,C,out_h,out_w] (all from that global)."""
+        b = bbox_norm.shape[0]
+        _, _, h, w = gf.shape
+        boxes = bbox_norm.to(gf.dtype).clone()
+        boxes[:, 0] *= w
+        boxes[:, 2] *= w
+        boxes[:, 1] *= h
+        boxes[:, 3] *= h
+        idx = torch.zeros(b, 1, device=gf.device, dtype=gf.dtype)  # all rois point to global 0
+        rois = torch.cat([idx, boxes], dim=1)
+        return roi_align(gf, rois, output_size=(int(out_hw[0]), int(out_hw[1])),
+                         spatial_scale=1.0, aligned=True)
+
+    def forward_local(self, g_feats, local_crop: torch.Tensor, bbox_norm: torch.Tensor) -> torch.Tensor:
+        """Predict a BATCH of tiles reusing precomputed global features (from encode_global)."""
+        l_feats = self.backbone(pixel_values=local_crop).feature_maps
+        fused = []
+        for i, (gf, lf) in enumerate(zip(g_feats, l_feats)):
+            region = self._global_region_shared(gf, bbox_norm, lf.shape[-2:])
+            fused.append(self.fuse[i](torch.cat([lf, region], dim=1)))
+        logits = self.decode_head(fused)
+        logits = F.interpolate(logits, size=local_crop.shape[-2:], mode="bilinear", align_corners=False)
+        return logits
+
 
 def build_glnet(num_classes: int = NUM_CLASSES, ignore_index: int = IGNORE_INDEX,
                 backbone_id: str = BACKBONE_ID, out_indices: list[int] | None = None) -> GlobalLocalUperNet:
